@@ -22,7 +22,8 @@ ESM (`"type": "module"`); `tsconfig.json` only includes root `*.ts`.
   (Tests are exempt; see below.)
 
 ## Credentials
-Stored locally in `.env` (gitignored; repo has no commits, so never in history).
+Stored locally in `.env` (gitignored; the repo is public on GitHub at
+`github.com/DSamuelHodge/upcoming-db` — `.env` has never been committed; keep it that way).
 - Daily: `DAILY_API_KEY` is an exact copy of `pass show services/daily/api-key`.
 - Turso: `TURSO_AUTH_TOKEN` / `LIBSQL_URL` are DB-scoped. The token authenticates
   directly at the DB endpoint (`...turso.io/v2/pipeline`), NOT through the management
@@ -38,6 +39,18 @@ Stored locally in `.env` (gitignored; repo has no commits, so never in history).
 `schema.ts` (Drizzle), `schema.sql` (applied to instances), and the `DDL` array in
 `test-db.ts`. No migrations are committed (`drizzle/` is empty/untracked). A schema change
 means editing all three plus the expected-tables list in `libsql-instance.test.ts`.
+(Plan v2 Phase 1 collapses this to two sources — `schema.ts` canonical, `schema.sql`
+applied identically to tests and prod — with a nightly drift guard; until that lands,
+all three stay in sync.)
+
+## Workflow
+- Git: feature branch + PR into `main`. No direct commits to `main` going forward;
+  CI (added by Item 0.5 of the plan) will gate merges once it exists.
+- Canonical remediation plan: `Docs/remediation-plan.md` (v2, with decision log) —
+  read it before doing any remediation work; `Docs/architecture-analysis.md` is the source analysis.
+- Redaction policy: no real addresses, phone numbers, or live hostnames in docs or code —
+  use `[REDACTED_ADDRESS]` / `[REDACTED_PHONE]` / `[REDACTED_HOST]` placeholders.
+  (Code-side scrub of `notifications.ts` and the test fixture is pending as Item 0.)
 
 ## Architecture rules
 - `availability-engine.ts` is pure domain code: depends only on the `AvailabilityRepository`
