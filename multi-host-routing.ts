@@ -14,7 +14,7 @@ import {
 // multi-host policy (which can change per business requirement) lives here.
 // ============================================================================
 
-export type SchedulingType = "collective" | "round_robin";
+export type SchedulingType = "individual" | "collective" | "round_robin";
 
 export interface HostLoadRepository {
   /** Timestamp of each host's most recently *assigned* round-robin booking,

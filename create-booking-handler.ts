@@ -207,7 +207,10 @@ function toUtcIso(iso: string): string {
   return dt.toUTC().toISO()!;
 }
 
-function makeTxRepository(tx: Executor): AvailabilityRepository & HostLoadRepository {
+/** Repository over an Executor (drizzle db or tx). Exported for the HTTP
+ *  layer's read/availability endpoints; named `tx` for the handler's own
+ *  transactional usage. */
+export function makeTxRepository(tx: Executor): AvailabilityRepository & HostLoadRepository {
   return {
     async getSchedule(userId: number): Promise<Schedule> {
       const [schedule] = await tx.select().from(schedules).where(eq(schedules.userId, userId)).limit(1);
@@ -676,6 +679,7 @@ async function commitBooking(
           status: "accepted",
           idempotencyKey: input.idempotencyKey,
           location: JSON.stringify(chosen),
+          createdAt: DateTime.now().toUTC().toISO()!,
         })
         .returning({ id: bookings.id });
 
