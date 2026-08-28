@@ -11,8 +11,8 @@ import { openDb, openTestDb } from "./test-db";
 
 const LOCATIONS_JSON = JSON.stringify([
   { type: "integrations:daily", label: "Video (Daily.co)" },
-  { type: "inPerson", label: "In person — Brick House Blue, Hilliard", address: "4022 Green Stripe Lane, Hilliard, OH 43026" },
-  { type: "userPhone", label: "Phone", phone: "+16144074920", displayPhone: "(614) 407-4920" },
+  { type: "inPerson", label: "In person — Brick House Blue, Hilliard", address: "[REDACTED_ADDRESS]" },
+  { type: "userPhone", label: "Phone", phone: "+15555550100", displayPhone: "(555) 555-0100" },
 ]);
 
 const base = {
