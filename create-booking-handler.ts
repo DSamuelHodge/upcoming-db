@@ -15,7 +15,7 @@ import {
 import { EventTypeNotFoundError, loadEventType, LoadedEventType, SchemaClient } from "./event-types";
 import { assignRoundRobinHost, HostLoadRepository } from "./multi-host-routing";
 import * as schema from "./schema";
-import { attendees, availability, bookingHosts, bookings, hostMutexes, hostOccupancyTicks, schedules } from "./schema";
+import { attendees, availability, bookingHosts, bookings, hostOccupancyTicks, schedules } from "./schema";
 
 export { EventTypeNotFoundError };
 
@@ -235,16 +235,6 @@ function classifyUniqueViolation(err: unknown): ViolatedConstraint {
   return "other";
 }
 
-async function acquireHostMutex(tx: Executor, hostUserId: number): Promise<void> {
-  await tx
-    .insert(hostMutexes)
-    .values({ hostUserId })
-    .onConflictDoUpdate({
-      target: hostMutexes.hostUserId,
-      set: { hostUserId },
-    });
-}
-
 const OCCUPANCY_TICK_MS = 60_000;
 
 function occupancyTicks(
@@ -381,11 +371,6 @@ async function commitBooking(
         );
       }
       const repo = makeTxRepository(tx);
-
-      const hostsToLock = [...eventType.hostUserIds].sort((a, b) => a - b);
-      for (const hostId of hostsToLock) {
-        await acquireHostMutex(tx, hostId);
-      }
 
       const primaryHostId = eventType.hostUserIds[0];
       if (primaryHostId === undefined) {

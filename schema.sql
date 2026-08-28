@@ -90,10 +90,6 @@ CREATE TABLE IF NOT EXISTS attendees (
   phone TEXT
 );
 
-CREATE TABLE IF NOT EXISTS host_mutexes (
-  host_user_id INTEGER PRIMARY KEY REFERENCES users(id)
-);
-
 CREATE TABLE IF NOT EXISTS credentials (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id),
