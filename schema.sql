@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   buffer_before INTEGER NOT NULL DEFAULT 0,
   buffer_after INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'accepted',
+  cancelled_at TEXT,
   idempotency_key TEXT NOT NULL UNIQUE,
   location TEXT
 );

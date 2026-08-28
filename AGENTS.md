@@ -64,6 +64,10 @@ all three stay in sync.)
   `loadEventType()` throws on zero hosts; don't reintroduce owner_user_id branching.
 - Buffers are snapshotted onto the booking row at insert time; all conflict/occupancy logic
   reads the booking's stored buffers, not the live event type's.
+- Cancellation (`cancelBookingHandler`) stamps `cancelled_at` and deletes the booking's
+  occupancy ticks + `booking_hosts` rows in the SAME transaction — an unpruned tick blocks
+  the host's slot forever. Replays are idempotent by uid/idempotencyKey; `findOrphanedTicks`
+  is the reconciliation safety net for bookings lost without pruning.
 - Concurrency model: `host_occupancy_ticks` unique (host, minute-tick) is SQLite's stand-in
   for an exclusion constraint and is the actual serialization backstop — a losing tick insert
   surfaces as `SlotConflictError` in `createBookingHandler`, which also owns the SQLITE_BUSY

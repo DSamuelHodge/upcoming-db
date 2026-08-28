@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createClient } from "@libsql/client";
 import {
+  BookingNotFoundError,
   CreateBookingInput,
+  cancelBookingHandler,
   createBookingHandler,
+  findOrphanedTicks,
   SlotConflictError,
 } from "./create-booking-handler";
 import { loadEventType } from "./event-types";
@@ -252,6 +256,138 @@ test("normal non-overlapping sequential bookings on one host succeed", async () 
     assert.equal(second.status, "accepted");
     const rows = await db.select().from(attendees);
     assert.equal(rows.length, 2);
+  } finally {
+    close();
+  }
+});
+
+test("cancel stamps cancelled_at, prunes ticks and secondary hosts, frees the slot", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    const start = "2027-06-01T10:00:00.000Z";
+    const end = "2027-06-01T11:00:00.000Z";
+    const booked = await createBookingHandler(
+      db,
+      bookingInput({ slotStartUtc: start, slotEndUtc: end, idempotencyKey: "cancel-a" })
+    );
+
+    const ticksBefore = await db.$client.execute(
+      "SELECT COUNT(*) AS n FROM host_occupancy_ticks WHERE host_user_id = 1"
+    );
+    assert.equal(Number(ticksBefore.rows[0]!.n), 60);
+
+    const result = await cancelBookingHandler(db, { uid: booked.uid });
+    assert.equal(result.status, "cancelled");
+    assert.equal(result.replay, false);
+    assert.equal(result.uid, booked.uid);
+
+    const [row] = await db.$client.execute(
+      "SELECT status, cancelled_at FROM bookings WHERE uid = ?",
+      [booked.uid]
+    ).then((r) => r.rows);
+    assert.equal(row!.status, "cancelled");
+    assert.ok(row!.cancelled_at, "cancelled_at must be stamped");
+
+    const ticksAfter = await db.$client.execute(
+      "SELECT COUNT(*) AS n FROM host_occupancy_ticks WHERE host_user_id = 1"
+    );
+    assert.equal(Number(ticksAfter.rows[0]!.n), 0, "ticks must be pruned on cancel");
+
+    // The freed slot must be bookable again by a different request.
+    const rebooked = await createBookingHandler(
+      db,
+      bookingInput({ slotStartUtc: start, slotEndUtc: end, idempotencyKey: "cancel-b" })
+    );
+    assert.equal(rebooked.status, "accepted");
+  } finally {
+    close();
+  }
+});
+
+test("cancel is idempotent by uid", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    const booked = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "idem-cancel",
+      })
+    );
+
+    const first = await cancelBookingHandler(db, { uid: booked.uid });
+    assert.equal(first.status, "cancelled");
+    assert.equal(first.replay, false);
+
+    const second = await cancelBookingHandler(db, { uid: booked.uid });
+    assert.equal(second.uid, booked.uid);
+    assert.equal(second.status, "cancelled");
+    assert.equal(second.replay, true);
+  } finally {
+    close();
+  }
+});
+
+test("cancel by idempotency key and 404 on unknown booking", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    const booked = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "by-key",
+      })
+    );
+
+    const byKey = await cancelBookingHandler(db, { idempotencyKey: "by-key" });
+    assert.equal(byKey.uid, booked.uid);
+    assert.equal(byKey.status, "cancelled");
+
+    await assert.rejects(cancelBookingHandler(db, { uid: "no-such-uid" }), BookingNotFoundError);
+    await assert.rejects(
+      cancelBookingHandler(db, { idempotencyKey: "no-such-key" }),
+      BookingNotFoundError
+    );
+    await assert.rejects(cancelBookingHandler(db, {}), /requires uid or idempotencyKey/);
+  } finally {
+    close();
+  }
+});
+
+test("findOrphanedTicks reports ticks whose booking row disappeared", async () => {
+  const { db, file, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    const booked = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "orphan-a",
+      })
+    );
+
+    assert.deepEqual(await findOrphanedTicks(db), []);
+
+    // Simulate the failure mode (booking row lost without tick pruning) by
+    // deleting the booking on a client with foreign keys off.
+    const raw = createClient({ url: `file:${file}` });
+    await raw.execute("PRAGMA foreign_keys = OFF");
+    await raw.execute({ sql: "DELETE FROM bookings WHERE uid = ?", args: [booked.uid] });
+
+    const orphans = await findOrphanedTicks(db);
+    assert.equal(orphans.length, 60);
+    assert.equal(orphans.every((o) => o.hostUserId === 1), true);
+    await raw.close();
   } finally {
     close();
   }
