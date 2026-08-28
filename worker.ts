@@ -265,6 +265,9 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
         currency: eventType.currency,
         description: `Upcoming booking: ${eventType.title || `event type ${eventTypeId}`}`,
         "automatic_payment_methods[enabled]": "true",
+        // The Android SDK confirms cards in-app (no browser redirect); without
+        // this Stripe refuses confirmation unless a return_url is supplied.
+        "automatic_payment_methods[allow_redirects]": "never",
       });
       const res = await fetch("https://api.stripe.com/v1/payment_intents", {
         method: "POST",
