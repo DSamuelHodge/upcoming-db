@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { and, eq, gt, inArray, lt, max } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lt, max } from "drizzle-orm";
 import { LibSQLDatabase } from "drizzle-orm/libsql";
 import { DateTime } from "luxon";
 import { z } from "zod";
@@ -59,6 +59,17 @@ export class SlotConflictError extends Error {
 export class LocationNotOfferedError extends Error {
   readonly statusCode = 400 as const;
 }
+
+export class BookingNotFoundError extends Error {
+  readonly statusCode = 404 as const;
+}
+
+export type CancelBookingInput = {
+  /** Public booking id. */
+  uid?: string;
+  /** Caller's idempotency key (from the original booking request). */
+  idempotencyKey?: string;
+};
 
 function parseLocations(raw: unknown): ChosenLocation[] {
   if (typeof raw !== "string" || raw.length === 0) return [];
@@ -287,30 +298,117 @@ async function replayExistingBooking(db: AppDb, idempotencyKey: string): Promise
   ];
 
   const [att] = await db.select().from(attendees).where(eq(attendees.bookingId, existing.id)).limit(1);
-  const locRaw = (existing as unknown as { location?: string | null }).location ?? null;
-  let location: ChosenLocation;
-  try {
-    location = locRaw ? (JSON.parse(locRaw) as ChosenLocation) : ({ type: "inPerson" } as ChosenLocation);
-  } catch {
-    location = { type: "inPerson" } as ChosenLocation;
-  }
-
-  return {
-    uid: existing.uid,
-    eventTypeId: existing.eventTypeId,
-    hostUserId: existing.hostUserId,
+  return bookingToResult(
+    existing,
     attendingHostUserIds,
-    startUtc: existing.startTime,
-    endUtc: existing.endTime,
-    status: existing.status,
-    replay: true,
-    location,
-    attendee: { email: att?.email ?? "", name: att?.name ?? null, phone: att?.phone ?? null },
-  };
+    { email: att?.email ?? "", name: att?.name ?? null, phone: att?.phone ?? null },
+    true
+  );
 }
 
 function isSqliteBusy(err: unknown): boolean {
   return /SQLITE_BUSY|database is locked/i.test(errorText(err));
+}
+
+function bookingToResult(
+  row: typeof schema.bookings.$inferSelect,
+  attendingHostUserIds: number[],
+  attendee: { email: string; name?: string | null; phone?: string | null },
+  replay: boolean
+): BookingResult {
+  let location: ChosenLocation;
+  try {
+    location = row.location
+      ? (JSON.parse(row.location) as ChosenLocation)
+      : ({ type: "inPerson" } as ChosenLocation);
+  } catch {
+    location = { type: "inPerson" } as ChosenLocation;
+  }
+  return {
+    uid: row.uid,
+    eventTypeId: row.eventTypeId,
+    hostUserId: row.hostUserId,
+    attendingHostUserIds,
+    startUtc: row.startTime,
+    endUtc: row.endTime,
+    status: row.status,
+    replay,
+    location,
+    attendee,
+  };
+}
+
+/**
+ * Cancels a booking in one transaction: stamps status + cancelled_at, then
+ * removes the booking's occupancy ticks and secondary-host rows so the slot's
+ * availability footprint disappears atomically. Idempotent — cancelling an
+ * already-cancelled booking returns its current state (replay: true) instead
+ * of failing. Ticks must be pruned here: unique (host, tick) rows are the
+ * availability backstop, and orphaned ticks would block the slot forever.
+ */
+export async function cancelBookingHandler(db: AppDb, rawInput: CancelBookingInput): Promise<BookingResult> {
+  if (!rawInput.uid && !rawInput.idempotencyKey) {
+    throw new Error("cancelBookingHandler requires uid or idempotencyKey");
+  }
+
+  return await db.transaction(async (tx) => {
+    const match = rawInput.uid
+      ? eq(bookings.uid, rawInput.uid)
+      : eq(bookings.idempotencyKey, rawInput.idempotencyKey!);
+
+    const [existing] = await tx.select().from(bookings).where(match).limit(1);
+    if (!existing) {
+      throw new BookingNotFoundError(`No booking found for ${rawInput.uid ? `uid ${rawInput.uid}` : "the given idempotency key"}`);
+    }
+
+    const extras = await tx
+      .select({ hostUserId: bookingHosts.hostUserId })
+      .from(bookingHosts)
+      .where(eq(bookingHosts.bookingId, existing.id));
+    const [att] = await tx.select().from(attendees).where(eq(attendees.bookingId, existing.id)).limit(1);
+    const attendee = { email: att?.email ?? "", name: att?.name ?? null, phone: att?.phone ?? null };
+
+    if (existing.status === "cancelled") {
+      return bookingToResult(
+        existing,
+        [existing.hostUserId, ...extras.map((r) => r.hostUserId).filter((id) => id !== existing.hostUserId)],
+        attendee,
+        true
+      );
+    }
+
+    const cancelledAt = new Date().toISOString();
+    await tx
+      .update(bookings)
+      .set({ status: "cancelled", cancelledAt })
+      .where(and(eq(bookings.id, existing.id), inArray(bookings.status, [...ACTIVE_BOOKING_STATUSES])));
+
+    await tx.delete(hostOccupancyTicks).where(eq(hostOccupancyTicks.bookingId, existing.id));
+    await tx.delete(bookingHosts).where(eq(bookingHosts.bookingId, existing.id));
+
+    return bookingToResult(
+      { ...existing, status: "cancelled", cancelledAt },
+      [existing.hostUserId],
+      attendee,
+      false
+    );
+  });
+}
+
+/** Safety net: ticks whose booking row is gone would block a host's slot forever. */
+export async function findOrphanedTicks(
+  db: AppDb
+): Promise<Array<{ tickId: number; bookingId: number; hostUserId: number }>> {
+  const rows = await db
+    .select({
+      tickId: hostOccupancyTicks.id,
+      bookingId: hostOccupancyTicks.bookingId,
+      hostUserId: hostOccupancyTicks.hostUserId,
+    })
+    .from(hostOccupancyTicks)
+    .leftJoin(bookings, eq(bookings.id, hostOccupancyTicks.bookingId))
+    .where(isNull(bookings.id));
+  return rows;
 }
 
 export async function createBookingHandler(db: AppDb, rawInput: unknown): Promise<BookingResult> {

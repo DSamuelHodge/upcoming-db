@@ -117,6 +117,8 @@ export const bookings = sqliteTable(
     status: text("status", { enum: ["pending", "accepted", "cancelled", "rejected"] })
       .notNull()
       .default("accepted"),
+    // ISO 8601 UTC instant stamped by cancelBookingHandler; null until cancelled.
+    cancelledAt: text("cancelled_at"),
     idempotencyKey: text("idempotency_key").notNull().unique(),
     // JSON of the CHOSEN location option (with `url` when integrations:daily),
     // not the whole event-type menu.

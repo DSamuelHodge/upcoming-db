@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsx --test availability-engine.test.ts multi-host-routing.test.ts create-booking-handler.test.ts libsql-instance.test.ts",
+    "test": "tsx --test \"*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "schema:apply": "tsx apply-schema.ts",
     "drift:check": "tsx check-schema-drift.ts",
