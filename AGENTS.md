@@ -32,7 +32,7 @@ Stored locally in `.env` (gitignored; repo has no commits, so never in history).
 - Verify the live DB with a read-only pipeline query (DB token as Bearer):
   `curl -H "Authorization: Bearer $TURSO_AUTH_TOKEN" -H "Content-Type: application/json" \
     -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT uid,status FROM bookings"}}]}' \
-    https://upcoming-db-hodgederrick.aws-us-west-2.turso.io/v2/pipeline`
+    https://upcoming-db-[REDACTED_HOST].aws-us-west-2.turso.io/v2/pipeline`
 
 ## Schema lives in three places — keep them in sync
 `schema.ts` (Drizzle), `schema.sql` (applied to instances), and the `DDL` array in
