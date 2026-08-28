@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { and, eq, gt, inArray, isNull, lt, max } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lt, max, sql } from "drizzle-orm";
 import { LibSQLDatabase } from "drizzle-orm/libsql";
 import { DateTime } from "luxon";
 import { z } from "zod";
@@ -89,8 +89,100 @@ function errorText(err: unknown): string {
   return `${err.message} ${cause}`;
 }
 
-/** Blunt range pad so bookings whose stored buffers reach into this slot are fetched. */
-const HOST_FREE_RANGE_PAD_MINUTES = 1440;
+/**
+ * Fixed window handed to the availability engine for the working-hours,
+ * min-notice, and slot-alignment checks. Covers any local-day boundary
+ * (UTC offsets run ±14h) plus overnight windows spilling into the next day.
+ * Conflicts with other bookings' snapshotted buffers are checked exactly in
+ * SQL by bufferedOverlapExists and do NOT depend on this window's width.
+ */
+const ENGINE_CHECK_WINDOW_HOURS = 48;
+
+// A booking's conflict footprint is [start - bufferBefore, end + bufferAfter]
+// using ITS OWN snapshotted buffers. No fixed window can be wide enough for
+// arbitrary buffers, so expand each candidate booking's span in SQL instead.
+function bufferedOverlapCondition(slotStartUtc: string, slotEndUtc: string) {
+  return and(
+    sql`datetime(${bookings.endTime}, '+' || MAX(${bookings.bufferAfter}, 0) || ' minutes') > datetime(${slotStartUtc})`,
+    sql`datetime(${bookings.startTime}, '-' || MAX(${bookings.bufferBefore}, 0) || ' minutes') < datetime(${slotEndUtc})`
+  );
+}
+
+async function bufferedOverlapExists(
+  tx: Executor,
+  hostUserId: number,
+  slotStartUtc: string,
+  slotEndUtc: string
+): Promise<boolean> {
+  const overlap = bufferedOverlapCondition(slotStartUtc, slotEndUtc);
+  const active = inArray(bookings.status, [...ACTIVE_BOOKING_STATUSES]);
+
+  const asPrimary = await tx
+    .select({ id: bookings.id })
+    .from(bookings)
+    .where(and(eq(bookings.hostUserId, hostUserId), active, overlap))
+    .limit(1);
+  if (asPrimary.length > 0) return true;
+
+  const asSecondary = await tx
+    .select({ id: bookings.id })
+    .from(bookings)
+    .innerJoin(bookingHosts, eq(bookingHosts.bookingId, bookings.id))
+    .where(and(eq(bookingHosts.hostUserId, hostUserId), active, overlap))
+    .limit(1);
+  return asSecondary.length > 0;
+}
+
+async function isHostFree(
+  tx: Executor,
+  repo: AvailabilityRepository,
+  eventType: LoadedEventType,
+  hostUserId: number,
+  slotStartUtc: string,
+  slotEndUtc: string
+): Promise<boolean> {
+  if (await bufferedOverlapExists(tx, hostUserId, slotStartUtc, slotEndUtc)) {
+    return false;
+  }
+
+  const rangeStart = DateTime.fromISO(slotStartUtc, { zone: "utc" }).minus({
+    hours: ENGINE_CHECK_WINDOW_HOURS,
+  });
+  const rangeEnd = DateTime.fromISO(slotEndUtc, { zone: "utc" }).plus({
+    hours: ENGINE_CHECK_WINDOW_HOURS,
+  });
+  if (!rangeStart.isValid || !rangeEnd.isValid) {
+    throw new Error(`Invalid slot bounds: ${slotStartUtc}–${slotEndUtc}`);
+  }
+
+  const slots = await computeAvailability(repo, {
+    userId: hostUserId,
+    eventTypeId: eventType.id,
+    rangeStartUtc: rangeStart.toISO()!,
+    rangeEndUtc: rangeEnd.toISO()!,
+  });
+
+  const target = DateTime.fromISO(slotStartUtc, { zone: "utc" });
+  const targetEnd = DateTime.fromISO(slotEndUtc, { zone: "utc" });
+  return slots.some(
+    (s) =>
+      DateTime.fromISO(s.startUtc, { zone: "utc" }).equals(target) &&
+      DateTime.fromISO(s.endUtc, { zone: "utc" }).equals(targetEnd)
+  );
+}
+
+async function assertHostStillFree(
+  tx: Executor,
+  repo: AvailabilityRepository,
+  eventType: LoadedEventType,
+  hostUserId: number,
+  slotStartUtc: string,
+  slotEndUtc: string
+): Promise<void> {
+  if (!(await isHostFree(tx, repo, eventType, hostUserId, slotStartUtc, slotEndUtc))) {
+    throw new SlotConflictError(`Host ${hostUserId} is no longer available for ${slotStartUtc}–${slotEndUtc}`);
+  }
+}
 
 function toUtcIso(iso: string): string {
   const dt = DateTime.fromISO(iso, { zone: "utc" });
@@ -187,51 +279,6 @@ function makeTxRepository(tx: Executor): AvailabilityRepository & HostLoadReposi
       return result;
     },
   };
-}
-
-async function isHostFree(
-  repo: AvailabilityRepository,
-  eventType: LoadedEventType,
-  hostUserId: number,
-  slotStartUtc: string,
-  slotEndUtc: string
-): Promise<boolean> {
-  const paddedStart = DateTime.fromISO(slotStartUtc, { zone: "utc" }).minus({
-    minutes: eventType.bufferBefore + HOST_FREE_RANGE_PAD_MINUTES,
-  });
-  const paddedEnd = DateTime.fromISO(slotEndUtc, { zone: "utc" }).plus({
-    minutes: eventType.bufferAfter + HOST_FREE_RANGE_PAD_MINUTES,
-  });
-  if (!paddedStart.isValid || !paddedEnd.isValid) {
-    throw new Error(`Invalid slot bounds: ${slotStartUtc}–${slotEndUtc}`);
-  }
-
-  const slots = await computeAvailability(repo, {
-    userId: hostUserId,
-    eventTypeId: eventType.id,
-    rangeStartUtc: paddedStart.toISO()!,
-    rangeEndUtc: paddedEnd.toISO()!,
-  });
-
-  const target = DateTime.fromISO(slotStartUtc, { zone: "utc" });
-  const targetEnd = DateTime.fromISO(slotEndUtc, { zone: "utc" });
-  return slots.some(
-    (s) =>
-      DateTime.fromISO(s.startUtc, { zone: "utc" }).equals(target) &&
-      DateTime.fromISO(s.endUtc, { zone: "utc" }).equals(targetEnd)
-  );
-}
-
-async function assertHostStillFree(
-  repo: AvailabilityRepository,
-  eventType: LoadedEventType,
-  hostUserId: number,
-  slotStartUtc: string,
-  slotEndUtc: string
-): Promise<void> {
-  if (!(await isHostFree(repo, eventType, hostUserId, slotStartUtc, slotEndUtc))) {
-    throw new SlotConflictError(`Host ${hostUserId} is no longer available for ${slotStartUtc}–${slotEndUtc}`);
-  }
 }
 
 type ViolatedConstraint = "idempotency_key" | "host_slot" | "other";
@@ -480,18 +527,18 @@ async function commitBooking(
 
       if (eventType.schedulingType === "individual") {
         hostUserId = primaryHostId;
-        await assertHostStillFree(repo, eventType, hostUserId, slotStartUtc, slotEndUtc);
+        await assertHostStillFree(tx, repo, eventType, hostUserId, slotStartUtc, slotEndUtc);
         attendingHostUserIds = [hostUserId];
       } else if (eventType.schedulingType === "collective") {
         for (const candidateId of eventType.hostUserIds) {
-          await assertHostStillFree(repo, eventType, candidateId, slotStartUtc, slotEndUtc);
+          await assertHostStillFree(tx, repo, eventType, candidateId, slotStartUtc, slotEndUtc);
         }
         hostUserId = primaryHostId;
         attendingHostUserIds = eventType.hostUserIds;
       } else {
         const stillFree: number[] = [];
         for (const candidateId of eventType.hostUserIds) {
-          if (await isHostFree(repo, eventType, candidateId, slotStartUtc, slotEndUtc)) {
+          if (await isHostFree(tx, repo, eventType, candidateId, slotStartUtc, slotEndUtc)) {
             stillFree.push(candidateId);
           }
         }

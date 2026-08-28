@@ -35,13 +35,14 @@ Stored locally in `.env` (gitignored; the repo is public on GitHub at
     -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT uid,status FROM bookings"}}]}' \
     https://upcoming-db-[REDACTED_HOST].aws-us-west-2.turso.io/v2/pipeline`
 
-## Schema lives in three places — keep them in sync
-`schema.ts` (Drizzle), `schema.sql` (applied to instances), and the `DDL` array in
-`test-db.ts`. No migrations are committed (`drizzle/` is empty/untracked). A schema change
-means editing all three plus the expected-tables list in `libsql-instance.test.ts`.
-(Plan v2 Phase 1 collapses this to two sources — `schema.ts` canonical, `schema.sql`
-applied identically to tests and prod — with a nightly drift guard; until that lands,
-all three stay in sync.)
+## Schema lives in two places — keep them in sync
+`schema.ts` (canonical Drizzle) and `schema.sql` (applied identically to tests via
+`schema-sql.ts` and to prod via `apply-schema.ts`). `test-db.ts` no longer holds its own
+DDL, and `libsql-instance.test.ts` derives expected tables from `schema.ts`. No migrations
+are committed (`drizzle/` is empty/untracked) — a schema change means editing both files;
+the live instance may additionally need a one-off additive `ALTER` because
+`CREATE TABLE IF NOT EXISTS` never upgrades existing tables. The column-level drift guard
+(`npm run drift:check`, nightly non-blocking CI job) catches divergence.
 
 ## Workflow
 - Git: feature branch + PR into `main`. No direct commits to `main` going forward;
@@ -63,7 +64,10 @@ all three stay in sync.)
 - Every event type has rows in `event_type_hosts`, including `individual` ones.
   `loadEventType()` throws on zero hosts; don't reintroduce owner_user_id branching.
 - Buffers are snapshotted onto the booking row at insert time; all conflict/occupancy logic
-  reads the booking's stored buffers, not the live event type's.
+  reads the booking's stored buffers, not the live event type's. The commit-time conflict
+  check expands each candidate booking's span by its own stored buffers in SQL
+  (`bufferedOverlapExists`) — no fixed window pad — while the availability-engine re-check
+  inside the transaction only covers working-hours/notice/alignment over a ±48h window.
 - Cancellation (`cancelBookingHandler`) stamps `cancelled_at` and deletes the booking's
   occupancy ticks + `booking_hosts` rows in the SAME transaction — an unpruned tick blocks
   the host's slot forever. Replays are idempotent by uid/idempotencyKey; `findOrphanedTicks`

@@ -10,7 +10,7 @@ import {
   SlotConflictError,
 } from "./create-booking-handler";
 import { loadEventType } from "./event-types";
-import { attendees, availability, eventTypeHosts, eventTypes, schedules, users } from "./schema";
+import { attendees, availability, bookings, eventTypeHosts, eventTypes, schedules, users } from "./schema";
 import { openDb, openTestDb } from "./test-db";
 
 const LOCATIONS_JSON = JSON.stringify([
@@ -388,6 +388,64 @@ test("findOrphanedTicks reports ticks whose booking row disappeared", async () =
     assert.equal(orphans.length, 60);
     assert.equal(orphans.every((o) => o.hostUserId === 1), true);
     await raw.close();
+  } finally {
+    close();
+  }
+});
+
+test("adjacent booking with a huge buffer blocks the slot (exact SQL, no fixed pad)", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    // Raw span ends 35h before the slot, but bufferAfter = 2880min (48h)
+    // stretches its footprint past the slot. The old 1440-minute window pad
+    // never fetched this row and wrongly accepted the slot.
+    await db.insert(bookings).values({
+      uid: "big-buffer-1",
+      eventTypeId: 1,
+      hostUserId: 1,
+      startTime: "2027-05-30T22:00:00.000Z",
+      endTime: "2027-05-30T23:00:00.000Z",
+      bufferBefore: 0,
+      bufferAfter: 2880,
+      status: "accepted",
+      idempotencyKey: "big-buffer-1",
+    });
+
+    await assert.rejects(
+      createBookingHandler(
+        db,
+        bookingInput({
+          slotStartUtc: "2027-06-01T10:00:00.000Z",
+          slotEndUtc: "2027-06-01T11:00:00.000Z",
+          idempotencyKey: "big-buffer-attempt",
+        })
+      ),
+      SlotConflictError
+    );
+  } finally {
+    close();
+  }
+});
+
+test("off-grid slot is rejected (slot-grid alignment preserved)", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    // Slots step by 30 from window start (00:00) — 09:07 is not on the grid.
+    await assert.rejects(
+      createBookingHandler(
+        db,
+        bookingInput({
+          slotStartUtc: "2027-06-01T09:07:00.000Z",
+          slotEndUtc: "2027-06-01T09:37:00.000Z",
+          idempotencyKey: "off-grid",
+        })
+      ),
+      SlotConflictError
+    );
   } finally {
     close();
   }
