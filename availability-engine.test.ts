@@ -344,3 +344,22 @@ test("slot matching treats Z and +00:00 as the same instant", async () => {
     true
   );
 });
+
+test("spring-forward 2026-03-08: 02:15–02:45 local (both ends nonexistent) yields zero slots", async () => {
+  // Both the window start and end fall inside the 02:00->03:00 gap.
+  // firstValidAtOrAfter / lastValidAtOrBefore snap both ends to 03:00 EDT,
+  // producing end <= start — the engine must resolve that to zero slots,
+  // not loop or emit a degenerate slot.
+  const slots = await computeAvailability(
+    repo({ schedule: overrideSchedule("2026-03-08", "02:15", "02:45") }),
+    {
+      userId: 1,
+      eventTypeId: 1,
+      rangeStartUtc: "2026-03-08T00:00:00.000Z",
+      rangeEndUtc: "2026-03-09T00:00:00.000Z",
+      now: DateTime.fromISO("2026-03-01T00:00:00.000Z", { zone: "utc" }),
+    }
+  );
+
+  assert.equal(slots.length, 0);
+});

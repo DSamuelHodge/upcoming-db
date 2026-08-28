@@ -13,6 +13,8 @@ import {
   Schedule,
 } from "./availability-engine";
 import { EventTypeNotFoundError, loadEventType, LoadedEventType, SchemaClient } from "./event-types";
+import { InvalidJsonColumnError, parseLocationsColumn } from "./json-columns";
+import { logWarn } from "./logger";
 import { assignRoundRobinHost, HostLoadRepository } from "./multi-host-routing";
 import * as schema from "./schema";
 import { attendees, availability, bookingHosts, bookings, hostOccupancyTicks, schedules } from "./schema";
@@ -71,14 +73,27 @@ export type CancelBookingInput = {
   idempotencyKey?: string;
 };
 
-function parseLocations(raw: unknown): ChosenLocation[] {
-  if (typeof raw !== "string" || raw.length === 0) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ChosenLocation[]) : [];
-  } catch {
-    return [];
+export type HttpErrorMapping = { status: number; message: string };
+
+/**
+ * Contract for the HTTP layer: map handler errors to responses.
+ * - 409 SlotConflictError (slot taken / not on grid / out of hours)
+ * - 404 BookingNotFoundError (cancellation of unknown booking)
+ * - 400 LocationNotOfferedError and request-validation failures (ZodError)
+ * - anything else, including InvalidJsonColumnError and internal faults:
+ *   500 with a generic message — internal error text is never leaked to clients.
+ */
+export function mapErrorToHttp(err: unknown): HttpErrorMapping {
+  if (err instanceof SlotConflictError) return { status: err.statusCode, message: err.message };
+  if (err instanceof BookingNotFoundError) return { status: err.statusCode, message: err.message };
+  if (err instanceof LocationNotOfferedError) return { status: err.statusCode, message: err.message };
+  if (err instanceof z.ZodError) {
+    const detail = err.issues
+      .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+      .join("; ");
+    return { status: 400, message: `Invalid request: ${detail}` };
   }
+  return { status: 500, message: "Internal server error" };
 }
 
 const ACTIVE_BOOKING_STATUSES = ["pending", "accepted"] as const;
@@ -469,7 +484,10 @@ export async function createBookingHandler(db: AppDb, rawInput: unknown): Promis
     try {
       const result = await commitBooking(db, input, slotStartUtc, slotEndUtc);
       // Availability unchanged by location; only confirmation differs.
-      void sendBookingConfirmation({ result, guestPhone: result.attendee.phone ?? null }).catch(() => {});
+      // Fire-and-forget, but failures are logged (with uid), not swallowed.
+      void sendBookingConfirmation({ result, guestPhone: result.attendee.phone ?? null }).catch((err) => {
+        logWarn("booking_confirmation_failed", { uid: result.uid, error: errorText(err) });
+      });
       return result;
     } catch (err) {
       lastErr = err;
@@ -508,7 +526,7 @@ async function commitBooking(
         .from(schema.eventTypes)
         .where(eq(schema.eventTypes.id, input.eventTypeId))
         .limit(1);
-      const menu = parseLocations(etRow?.locations);
+      const menu = parseLocationsColumn(etRow?.locations);
       const menuEntry = menu.find((m) => m.type === input.location.type);
       if (!menuEntry) {
         throw new LocationNotOfferedError(

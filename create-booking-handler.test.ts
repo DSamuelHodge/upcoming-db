@@ -7,8 +7,12 @@ import {
   cancelBookingHandler,
   createBookingHandler,
   findOrphanedTicks,
+  LocationNotOfferedError,
+  mapErrorToHttp,
   SlotConflictError,
 } from "./create-booking-handler";
+import { InvalidJsonColumnError } from "./json-columns";
+import { eq } from "drizzle-orm";
 import { loadEventType } from "./event-types";
 import { attendees, availability, bookings, eventTypeHosts, eventTypes, schedules, users } from "./schema";
 import { openDb, openTestDb } from "./test-db";
@@ -445,6 +449,50 @@ test("off-grid slot is rejected (slot-grid alignment preserved)", async () => {
         })
       ),
       SlotConflictError
+    );
+  } finally {
+    close();
+  }
+});
+
+test("mapErrorToHttp: conflict 409, validation 400, unknown 500 without leaking internals", () => {
+  assert.deepEqual(mapErrorToHttp(new SlotConflictError("taken")), {
+    status: 409,
+    message: "taken",
+  });
+  assert.deepEqual(mapErrorToHttp(new BookingNotFoundError("nope")), {
+    status: 404,
+    message: "nope",
+  });
+  assert.deepEqual(mapErrorToHttp(new LocationNotOfferedError("bad location")), {
+    status: 400,
+    message: "bad location",
+  });
+  const validation = CreateBookingInput.safeParse({}).error!;
+  assert.equal(mapErrorToHttp(validation).status, 400);
+  // Internal errors never leak their message to the client.
+  const leaked = mapErrorToHttp(new InvalidJsonColumnError("users.metadata", new Error("secret detail")));
+  assert.equal(leaked.status, 500);
+  assert.equal(leaked.message, "Internal server error");
+});
+
+test("malformed event_types.locations fails loudly instead of rejecting every location", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    await db.update(eventTypes).set({ locations: "{not json" }).where(eq(eventTypes.id, 1));
+
+    await assert.rejects(
+      createBookingHandler(
+        db,
+        bookingInput({
+          slotStartUtc: "2027-06-01T10:00:00.000Z",
+          slotEndUtc: "2027-06-01T11:00:00.000Z",
+          idempotencyKey: "bad-locations",
+        })
+      ),
+      InvalidJsonColumnError
     );
   } finally {
     close();
