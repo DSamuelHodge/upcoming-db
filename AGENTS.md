@@ -65,9 +65,12 @@ all three stay in sync.)
 - Buffers are snapshotted onto the booking row at insert time; all conflict/occupancy logic
   reads the booking's stored buffers, not the live event type's.
 - Concurrency model: `host_occupancy_ticks` unique (host, minute-tick) is SQLite's stand-in
-  for an exclusion constraint; `host_mutexes` INSERT-ON-CONFLICT serializes writers because
-  drizzle-libsql ignores `BEGIN IMMEDIATE`. Keep both when touching the transaction;
-  SQLITE_BUSY retry lives in `createBookingHandler`.
+  for an exclusion constraint and is the actual serialization backstop — a losing tick insert
+  surfaces as `SlotConflictError` in `createBookingHandler`, which also owns the SQLITE_BUSY
+  retry. drizzle-libsql ignores `BEGIN IMMEDIATE`; correctness rests on the tick index plus
+  Turso Cloud's single-primary write serialization, verified by the live two-client
+  contention test in `libsql-instance.test.ts`. The former `host_mutexes` table was a no-op
+  (its INSERT-ON-CONFLICT released at statement end, not commit) and was removed.
 
 ## Tests
 - `node:test` + `assert/strict` via tsx — no vitest/jest.

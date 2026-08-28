@@ -174,14 +174,6 @@ export const attendees = sqliteTable("attendees", {
   phone: text("phone"),
 });
 
-// One row per host; INSERT ... ON CONFLICT UPDATE serializes writers in SQLite
-// without relying on BEGIN IMMEDIATE (drizzle-libsql ignores transaction behavior).
-export const hostMutexes = sqliteTable("host_mutexes", {
-  hostUserId: integer("host_user_id")
-    .primaryKey()
-    .references(() => users.id),
-});
-
 export const credentials = sqliteTable("credentials", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   userId: integer("user_id")

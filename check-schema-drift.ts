@@ -16,14 +16,23 @@ function isLibsqlInstance(value: string | undefined): value is string {
   return value.startsWith("http://") || value.startsWith("https://") || value.startsWith("libsql://");
 }
 
-function expectedObjects(): { tables: string[]; indexes: string[] } {
+function expectedObjects(): {
+  tables: string[];
+  indexes: string[];
+  columnsByTable: Map<string, string[]>;
+} {
   const tables: string[] = [];
   const indexes: string[] = [];
+  const columnsByTable = new Map<string, string[]>();
   for (const value of Object.values(schema)) {
     if (!(value instanceof Table)) continue;
     const name = getTableName(value);
     if (name.startsWith("sqlite_")) continue;
     tables.push(name);
+    columnsByTable.set(
+      name,
+      getTableConfig(value).columns.map((c) => c.name)
+    );
     for (const idx of getTableConfig(value).indexes) {
       const idxName = idx.config.name;
       // UNIQUE column constraints create unnamed sqlite_autoindex_* entries;
@@ -31,7 +40,7 @@ function expectedObjects(): { tables: string[]; indexes: string[] } {
       if (idxName && !idxName.startsWith("sqlite_")) indexes.push(idxName);
     }
   }
-  return { tables: tables.sort(), indexes: indexes.sort() };
+  return { tables: tables.sort(), indexes: indexes.sort(), columnsByTable };
 }
 
 async function main(): Promise<void> {
@@ -53,7 +62,19 @@ async function main(): Promise<void> {
     const liveTableNames = new Set(liveTables.rows.map((r) => String(r.name)));
     const liveIndexNames = new Set(liveIndexes.rows.map((r) => String(r.name)));
 
-    const { tables, indexes } = expectedObjects();
+    const { tables, indexes, columnsByTable } = expectedObjects();
+
+    // Column-level comparison catches instances created from an older
+    // schema.sql that CREATE TABLE IF NOT EXISTS will never upgrade.
+    const missingColumns: string[] = [];
+    for (const [table, expectedColumns] of columnsByTable) {
+      if (!liveTableNames.has(table)) continue;
+      const info = await client.execute(`PRAGMA table_info('${table}')`);
+      const liveColumns = new Set(info.rows.map((r) => String(r.name)));
+      for (const col of expectedColumns) {
+        if (!liveColumns.has(col)) missingColumns.push(`${table}.${col}`);
+      }
+    }
 
     const missingTables = tables.filter((t) => !liveTableNames.has(t));
     const missingIndexes = indexes.filter((i) => !liveIndexNames.has(i));
@@ -62,16 +83,17 @@ async function main(): Promise<void> {
 
     for (const t of missingTables) console.error(`MISSING table: ${t}`);
     for (const i of missingIndexes) console.error(`MISSING index: ${i}`);
+    for (const c of missingColumns) console.error(`MISSING column: ${c}`);
     for (const t of extraTables) console.warn(`extra table on instance (informational): ${t}`);
     for (const i of extraIndexes) console.warn(`extra index on instance (informational): ${i}`);
 
-    if (missingTables.length > 0 || missingIndexes.length > 0) {
+    if (missingTables.length > 0 || missingIndexes.length > 0 || missingColumns.length > 0) {
       throw new Error(
-        `schema drift detected: ${missingTables.length} missing table(s), ${missingIndexes.length} missing index(es). Re-run \`npm run schema:apply\` against this instance.`
+        `schema drift detected: ${missingTables.length} missing table(s), ${missingIndexes.length} missing index(es), ${missingColumns.length} missing column(s). Tables/columns need a migration (CREATE TABLE IF NOT EXISTS will not upgrade existing tables); indexes are fixed by re-running \`npm run schema:apply\`.`
       );
     }
     console.log(
-      `check-schema-drift: OK — ${tables.length} tables, ${indexes.length} indexes from schema.ts all present on ${url}`
+      `check-schema-drift: OK — ${tables.length} tables (${[...columnsByTable.values()].flat().length} columns), ${indexes.length} indexes from schema.ts all present on ${url}`
     );
   } finally {
     client.close();

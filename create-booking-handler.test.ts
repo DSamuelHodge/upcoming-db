@@ -124,6 +124,17 @@ test("concurrent same primary same start: one succeeds, one 409", async () => {
     const err = (rejected[0] as PromiseRejectedResult).reason;
     assert.equal(err instanceof SlotConflictError, true);
     assert.equal((err as SlotConflictError).statusCode, 409);
+
+    // Invariants, not just outcomes: exactly one booking row and one tick set
+    // must exist for this host regardless of which request won.
+    const bookingCount = await opened.db.$client.execute(
+      "SELECT COUNT(*) AS n FROM bookings WHERE host_user_id = 1 AND start_time = '2027-06-01T10:00:00.000Z'"
+    );
+    assert.equal(Number(bookingCount.rows[0]!.n), 1);
+    const tickCount = await opened.db.$client.execute(
+      "SELECT COUNT(*) AS n FROM host_occupancy_ticks WHERE host_user_id = 1"
+    );
+    assert.equal(Number(tickCount.rows[0]!.n), 60);
   } finally {
     opened.close();
   }
