@@ -119,5 +119,6 @@ export function buildConfirmationEmail(input: ConfirmationInput): { subject: str
 export async function sendBookingConfirmation(input: ConfirmationInput): Promise<void> {
   const { subject, text, html } = buildConfirmationEmail(input);
   // TODO: wire AgentMail send here. For now, log so behavior is visible and testable.
-  logInfo("agentmail_stub_send", { subject, text, html });
+  // Bodies are PII (phones, addresses, room URLs) — log metadata only, never text/html.
+  logInfo("agentmail_stub_send", { subject, textLength: text.length, htmlLength: html.length });
 }

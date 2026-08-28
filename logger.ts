@@ -9,7 +9,8 @@ type LogFields = Record<string, unknown>;
  * runtime code.
  */
 function emit(level: LogLevel, message: string, fields?: LogFields): void {
-  const line = JSON.stringify({ ts: new Date().toISOString(), level, message, ...fields });
+  // Canonical fields are written last so caller fields can never overwrite them.
+  const line = JSON.stringify({ ...fields, ts: new Date().toISOString(), level, message });
   if (level === "info") {
     console.log(line);
   } else {
