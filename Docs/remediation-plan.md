@@ -37,6 +37,11 @@
 
 ## Item 0.1 — 🔴 Turso endpoint rotation (administrative, parallel with Item 0)
 
+> **Done 2026-08-28:** provisioned `upcoming-db-v2`, imported schema (data parity
+> verified — all app tables empty post fixture-purge), minted a fresh DB-scoped token,
+> updated `.env` + repo Actions secrets, verified drift check + live suite against the
+> new endpoint, destroyed the exposed instance (old hostname now 404).
+
 Threat model: an open-repo DB hostname is a standing target for scanners, DDoS probes, and pool-exhaustion against a managed tier — unnecessary surface area even with valid auth.
 
 **Repo part (agent):** done — `AGENTS.md` now uses a placeholder host.

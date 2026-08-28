@@ -27,9 +27,13 @@ Stored locally in `.env` (gitignored; the repo is public on GitHub at
 - Daily: `DAILY_API_KEY` is an exact copy of `pass show services/daily/api-key`.
 - Turso: `TURSO_AUTH_TOKEN` / `LIBSQL_URL` are DB-scoped. The token authenticates
   directly at the DB endpoint (`...turso.io/v2/pipeline`), NOT through the management
-  API. `pass show turso/api-token` is the original management token but currently
-  returns "invalid api token" against api.turso.tech — do NOT rely on Pass to mint new
-  DB tokens; the working token already lives in `.env`.
+  API. `pass show turso/api-token` holds a management session JWT (works with the
+  `turso` CLI via `TURSO_API_TOKEN`) but it is SHORT-LIVED (~7 days) — when it
+  expires, refresh it with `turso auth login --headless` and re-store it in Pass.
+  DB-scoped tokens for instances are minted with `turso db tokens create <db-name>`
+  (the one in `.env` does not expire). Production instance is `upcoming-db-v2`
+  (endpoint rotated 2026-08-28 per Item 0.1; the old exposed instance is destroyed —
+  never reuse or mention the old hostname).
 - Verify the live DB with a read-only pipeline query (DB token as Bearer):
   `curl -H "Authorization: Bearer $TURSO_AUTH_TOKEN" -H "Content-Type: application/json" \
     -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT uid,status FROM bookings"}}]}' \
