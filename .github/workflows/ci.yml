@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Hermetic by design (Plan v2 Item 0.5): no secrets, no network dependencies.
+# libsql-instance.test.ts self-skips without LIBSQL_URL/TURSO_DATABASE_URL;
+# live-instance checks (drift guard, contention tests) belong in a separate
+# scheduled, non-blocking job — not this PR gate.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
