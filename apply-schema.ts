@@ -1,5 +1,5 @@
-import { readFileSync } from "fs";
 import { createClient } from "@libsql/client";
+import { readSchemaSql, statementsFromSql } from "./schema-sql";
 
 function requireLibsqlUrl(): string {
   const url = process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL;
@@ -16,25 +16,11 @@ function requireLibsqlUrl(): string {
   return url;
 }
 
-function statementsFromSql(sql: string): string[] {
-  return sql
-    .split(";")
-    .map((s) =>
-      s
-        .split("\n")
-        .filter((line) => !line.trim().startsWith("--"))
-        .join("\n")
-        .trim()
-    )
-    .filter(Boolean);
-}
-
 const url = requireLibsqlUrl();
 const authToken = process.env.TURSO_AUTH_TOKEN;
 const client = createClient(authToken ? { url, authToken } : { url });
 
-const sql = readFileSync(new URL("./schema.sql", import.meta.url), "utf8");
-for (const stmt of statementsFromSql(sql)) {
+for (const stmt of statementsFromSql(readSchemaSql())) {
   await client.execute(stmt);
 }
 

@@ -6,6 +6,7 @@
     "test": "tsx --test \"*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "schema:apply": "tsx apply-schema.ts",
+    "drift:check": "tsx check-schema-drift.ts",
     "libsql:start": "mkdir -p .libsql-instance && sqld --db-path .libsql-instance --http-listen-addr 127.0.0.1:8080"
   },
   "dependencies": {

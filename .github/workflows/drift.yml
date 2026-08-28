@@ -1,0 +1,31 @@
+name: Schema drift
+
+# Scheduled, non-blocking informational job (Plan v2 Phase 1). Compares the
+# live LibSQL/Turso instance against the canonical Drizzle schema. It is NOT
+# a PR gate — PR CI (.github/workflows/ci.yml) stays hermetic.
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, offset from the hour
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Skips gracefully (exit 0) when the secrets are not configured.
+      - run: npm run drift:check
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}

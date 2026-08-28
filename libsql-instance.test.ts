@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createClient } from "@libsql/client";
 import { drizzle } from "drizzle-orm/libsql";
+import { Table, getTableName } from "drizzle-orm";
+import { getTableConfig } from "drizzle-orm/sqlite-core";
 import { createBookingHandler } from "./create-booking-handler";
 import { availability, eventTypeHosts, eventTypes, schedules, users } from "./schema";
 import * as schema from "./schema";
+import { openTestDb } from "./test-db";
 
 const url = process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL;
 
@@ -12,6 +15,63 @@ function isLibsqlInstance(value: string | undefined): value is string {
   if (!value) return false;
   return value.startsWith("http://") || value.startsWith("https://") || value.startsWith("libsql://");
 }
+
+function expectedTableNames(): string[] {
+  const names: string[] = [];
+  for (const value of Object.values(schema)) {
+    if (value instanceof Table) names.push(getTableName(value));
+  }
+  return names.sort();
+}
+
+// Offline: the test harness must apply the exact same DDL production applies
+// (schema.sql), so every table and named index in schema.ts exists in a
+// throwaway test db. This is the always-on half of the drift guard; the live
+// instance is checked by `npm run drift:check` (scheduled CI job).
+test("openTestDb applies every table and named index from schema.ts", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    const tables = await db.$client.execute(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    );
+    const tableNames = new Set(tables.rows.map((r) => String(r.name)));
+    for (const required of expectedTableNames()) {
+      assert.equal(tableNames.has(required), true, `missing table ${required}`);
+    }
+
+    const indexes = await db.$client.execute(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+    );
+    const indexNames = new Set(indexes.rows.map((r) => String(r.name)));
+    for (const value of Object.values(schema)) {
+      if (!(value instanceof Table)) continue;
+      for (const idx of getTableConfig(value).indexes) {
+        const name = idx.config.name;
+        if (!name || name.startsWith("sqlite_")) continue;
+        assert.equal(indexNames.has(name), true, `missing index ${name}`);
+      }
+    }
+  } finally {
+    close();
+  }
+});
+
+// The hand-written test DDL used to omit event_type_owner_slug_unique, so
+// handler tests could seed duplicate (owner, slug) pairs production forbids.
+// This test pins the constraint's presence through the harness.
+test("test harness enforces event_type_owner_slug_unique", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await db.insert(users).values({ email: "u@x.test", username: "u", timezone: "UTC" });
+    const [user] = await db.select().from(users);
+    await db.insert(eventTypes).values({ ownerUserId: user.id, slug: "dup", lengthMinutes: 30 });
+    await assert.rejects(
+      db.insert(eventTypes).values({ ownerUserId: user.id, slug: "dup", lengthMinutes: 30 })
+    );
+  } finally {
+    close();
+  }
+});
 
 test("LibSQL/Turso instance has the applied schema", async (t) => {
   if (!isLibsqlInstance(url)) {
@@ -27,19 +87,7 @@ test("LibSQL/Turso instance has the applied schema", async (t) => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
     );
     const names = tables.rows.map((r) => String(r.name));
-    for (const required of [
-      "users",
-      "schedules",
-      "availability",
-      "event_types",
-      "event_type_hosts",
-      "bookings",
-      "booking_hosts",
-      "attendees",
-      "host_occupancy_ticks",
-      "host_mutexes",
-      "credentials",
-    ]) {
+    for (const required of expectedTableNames()) {
       assert.equal(names.includes(required), true, `missing table ${required}`);
     }
 
