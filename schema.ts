@@ -10,6 +10,10 @@ export const users = sqliteTable("users", {
   username: text("username").notNull().unique(),
   timezone: text("timezone").notNull().default("UTC"),
   metadata: text("metadata").notNull().default("{}"), // JSON
+  // App-facing profile fields (additive, 2026-08-28): clients render these;
+  // the scheduling engine never reads them.
+  displayName: text("display_name").notNull().default(""),
+  avatarUrl: text("avatar_url").notNull().default(""),
 });
 
 export const schedules = sqliteTable(
@@ -65,6 +69,14 @@ export const eventTypes = sqliteTable(
       .default("individual"),
     locations: text("locations").notNull().default("[]"), // JSON array
     minBookingNotice: integer("min_booking_notice").notNull().default(0), // minutes
+    // App-facing presentation + paid-booking fields (additive, 2026-08-28).
+    // Availability/booking math ignores all of these.
+    title: text("title").notNull().default(""),
+    description: text("description").notNull().default(""),
+    priceInCents: integer("price_in_cents").notNull().default(0), // 0 = free
+    currency: text("currency").notNull().default("usd"),
+    colorHex: text("color_hex").notNull().default("#CC785C"),
+    isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
   },
   (t) => ({ ownerSlugUnique: uniqueIndex("event_type_owner_slug_unique").on(t.ownerUserId, t.slug) })
 );
@@ -123,6 +135,13 @@ export const bookings = sqliteTable(
     // JSON of the CHOSEN location option (with `url` when integrations:daily),
     // not the whole event-type menu.
     location: text("location"),
+    // Payment + audit fields (additive, 2026-08-28). `paid` flips only after
+    // the HTTP layer verifies the PaymentIntent succeeded; `created_at` is the
+    // insert-time ISO instant (set by the handler layer, nullable for rows
+    // written before the column existed).
+    paid: integer("paid", { mode: "boolean" }).notNull().default(false),
+    paymentIntentId: text("payment_intent_id"),
+    createdAt: text("created_at"),
   },
   (t) => ({
     hostTimeIdx: index("bookings_host_time_idx").on(t.hostUserId, t.startTime, t.endTime),
@@ -174,6 +193,7 @@ export const attendees = sqliteTable("attendees", {
   name: text("name"),
   timezone: text("timezone"),
   phone: text("phone"),
+  notes: text("notes"), // free-text note from the attendee (additive, 2026-08-28)
 });
 
 export const credentials = sqliteTable("credentials", {
