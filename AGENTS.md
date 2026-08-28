@@ -25,7 +25,7 @@ ESM (`"type": "module"`); `tsconfig.json` only includes root `*.ts`.
 Stored locally in `.env` (gitignored; the repo is public on GitHub at
 `github.com/DSamuelHodge/upcoming-db` — `.env` has never been committed; keep it that way).
 - Daily: `DAILY_API_KEY` in `.env` is a temporary dev/testing key (revoke after
-  conclusion); the real key belongs in repo Actions variables and/or `pass`.
+  conclusion); the real key belongs in repo Actions secrets and/or `pass`.
 - Turso: `TURSO_AUTH_TOKEN` / `LIBSQL_URL` are DB-scoped. The token authenticates
   directly at the DB endpoint (`...turso.io/v2/pipeline`), NOT through the management
   API. `pass show turso/api-token` holds a management session JWT (works with the

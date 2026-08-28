@@ -518,7 +518,11 @@ async function resolveChosenLocation(
       `location type ${input.location.type} is not offered by event type ${input.eventTypeId}`,
     );
   }
-  const chosen: ChosenLocation = { ...menuEntry };
+  // Strip a menu-provided dailyRoomName: only rooms minted for THIS booking
+  // may be torn down at cancel time — a shared/permanent room must never be
+  // deleted because its menu JSON happened to carry the field.
+  const { dailyRoomName: _menuRoomName, ...menuRest } = menuEntry;
+  const chosen: ChosenLocation = { ...menuRest };
   if (input.location.type !== "integrations:daily") return chosen;
 
   if (typeof chosen.url === "string" && chosen.url.length > 0) {
@@ -536,10 +540,27 @@ async function resolveChosenLocation(
   return { ...chosen, url, dailyRoomName: uid };
 }
 
+/** Deletes the attempt's minted room when the booking was NOT persisted under it. */
+async function teardownMintedRoom(chosen: ChosenLocation, uid: string): Promise<void> {
+  if (typeof chosen.dailyRoomName === "string" && chosen.dailyRoomName.length > 0) {
+    const deleted = await deleteDailyRoom(chosen.dailyRoomName);
+    if (!deleted) {
+      logWarn("daily_room_teardown_incomplete", { uid, roomName: chosen.dailyRoomName });
+    }
+  }
+}
+
 export async function createBookingHandler(db: AppDb, rawInput: unknown): Promise<BookingResult> {
   const input = CreateBookingInput.parse(rawInput);
   const slotStartUtc = toUtcIso(input.slotStartUtc);
   const slotEndUtc = toUtcIso(input.slotEndUtc);
+
+  // Fast replay path: a booking that already exists under this idempotency key
+  // carries its own room — return it without minting anything. (The insert-time
+  // replay below still handles the race where a concurrent first request
+  // commits after this check.)
+  const preexisting = await replayExistingBooking(db, input.idempotencyKey);
+  if (preexisting) return preexisting;
 
   // uid and the video room are resolved once, before any attempt: retries
   // reuse the same room name (duplicate-name recovery makes mint idempotent),
@@ -549,37 +570,46 @@ export async function createBookingHandler(db: AppDb, rawInput: unknown): Promis
 
   const maxAttempts = 16;
   let lastErr: unknown;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const result = await commitBooking(db, input, uid, chosen, slotStartUtc, slotEndUtc);
-      // Availability unchanged by location; only confirmation differs.
-      // Fire-and-forget, but failures are logged (with uid), not swallowed.
-      void sendBookingConfirmation({ result, guestPhone: result.attendee.phone ?? null }).catch((err) => {
-        logWarn("booking_confirmation_failed", { uid: result.uid, error: errorText(err) });
-      });
-      return result;
-    } catch (err) {
-      lastErr = err;
-      if (isSqliteBusy(err) && attempt < maxAttempts - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
-        continue;
+  let persisted = false;
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const result = await commitBooking(db, input, uid, chosen, slotStartUtc, slotEndUtc);
+        // Availability unchanged by location; only confirmation differs.
+        // Fire-and-forget, but failures are logged (with uid), not swallowed.
+        void sendBookingConfirmation({ result, guestPhone: result.attendee.phone ?? null }).catch((err) => {
+          logWarn("booking_confirmation_failed", { uid: result.uid, error: errorText(err) });
+        });
+        persisted = true;
+        return result;
+      } catch (err) {
+        lastErr = err;
+        if (isSqliteBusy(err) && attempt < maxAttempts - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+          continue;
+        }
+
+        const violation = classifyUniqueViolation(err);
+
+        if (violation === "idempotency_key") {
+          const existing = await replayExistingBooking(db, input.idempotencyKey);
+          if (existing) return existing;
+        }
+
+        if (violation === "host_slot") {
+          throw new SlotConflictError(`Slot ${slotStartUtc}–${slotEndUtc} was taken by a concurrent request`);
+        }
+
+        throw err;
       }
-
-      const violation = classifyUniqueViolation(err);
-
-      if (violation === "idempotency_key") {
-        const existing = await replayExistingBooking(db, input.idempotencyKey);
-        if (existing) return existing;
-      }
-
-      if (violation === "host_slot") {
-        throw new SlotConflictError(`Slot ${slotStartUtc}–${slotEndUtc} was taken by a concurrent request`);
-      }
-
-      throw err;
     }
+    throw lastErr;
+  } finally {
+    // Any terminal path that did not persist the booking under this attempt's
+    // room (replay, conflict, exhausted retries, unexpected error) must not
+    // leak the minted room — it would otherwise linger until exp.
+    if (!persisted) await teardownMintedRoom(chosen, uid);
   }
-  throw lastErr;
 }
 
 async function commitBooking(

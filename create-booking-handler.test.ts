@@ -577,3 +577,54 @@ dailyTest("pre-configured menu url wins and no room is minted", async (t) => {
     close();
   }
 });
+
+dailyTest("menu-provided dailyRoomName on a pre-configured room is ignored at cancel", async (t) => {
+  const { createDailyRoom, deleteDailyRoom } = await import("./daily");
+  const { db, close } = await openTestDb();
+  // A real shared room that must survive the booking's cancellation.
+  const sharedName = `shared-${Date.now()}`;
+  const sharedUrl = await createDailyRoom(sharedName, 0, Math.floor(Date.now() / 1000) + 3600);
+  if (!sharedUrl) {
+    close();
+    t.skip("Daily room creation failed");
+    return;
+  }
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    // Menu JSON smuggles a dailyRoomName — it must never be treated as
+    // booking-owned, otherwise cancel would delete the shared room.
+    await db
+      .update(eventTypes)
+      .set({
+        locations: JSON.stringify([
+          { type: "integrations:daily", label: "Video", url: sharedUrl, dailyRoomName: sharedName },
+          { type: "inPerson", label: "In person", address: "[REDACTED_ADDRESS]" },
+        ]),
+      })
+      .where(eq(eventTypes.id, 1));
+
+    const result = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "daily-shared-room-1",
+        location: { type: "integrations:daily" },
+      })
+    );
+    assert.equal(result.location.url, sharedUrl);
+    assert.equal(result.location.dailyRoomName, undefined, "menu-injected marker must be stripped");
+
+    const cancelled = await cancelBookingHandler(db, { uid: result.uid });
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(
+      await getDailyRoomUrl(sharedName),
+      sharedUrl,
+      "the shared room must survive the booking's cancellation"
+    );
+  } finally {
+    await deleteDailyRoom(sharedName);
+    close();
+  }
+});
