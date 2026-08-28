@@ -24,7 +24,8 @@ ESM (`"type": "module"`); `tsconfig.json` only includes root `*.ts`.
 ## Credentials
 Stored locally in `.env` (gitignored; the repo is public on GitHub at
 `github.com/DSamuelHodge/upcoming-db` — `.env` has never been committed; keep it that way).
-- Daily: `DAILY_API_KEY` is an exact copy of `pass show services/daily/api-key`.
+- Daily: `DAILY_API_KEY` in `.env` is a temporary dev/testing key (revoke after
+  conclusion); the real key belongs in repo Actions secrets and/or `pass`.
 - Turso: `TURSO_AUTH_TOKEN` / `LIBSQL_URL` are DB-scoped. The token authenticates
   directly at the DB endpoint (`...turso.io/v2/pipeline`), NOT through the management
   API. `pass show turso/api-token` holds a management session JWT (works with the
@@ -89,10 +90,22 @@ the live instance may additionally need a one-off additive `ALTER` because
 - Handler tests use `openTestDb()`: throwaway `file:booking-test-*.db` SQLite files,
   auto-deleted. `file:` URLs are fine here, only production paths reject them.
 - `libsql-instance.test.ts` self-skips unless `LIBSQL_URL`/`TURSO_DATABASE_URL` points at a
-  live instance — a green `npm test` does not mean those ran.
+  live instance — a green `npm test` does not mean those ran. Same for the live Daily.co
+  tests (`daily.test.ts` + the `dailyTest` flow tests), which self-skip without
+  `DAILY_API_KEY` and make real API calls when it is set.
 - Engine tests inject a fixed `now`; the spring-forward/fall-back tests are sensitive to the
   day-walk loop in `computeAvailability`.
 
 ## Stubs
-`daily.ts` returns null (no throw) when `DAILY_API_KEY` is unset; `notifications.ts` only
-logs — the AgentMail send is an unimplemented seam. Don't treat these as real integrations.
+`notifications.ts` only logs — the AgentMail send is an unimplemented seam (content is
+built for real; only delivery is stubbed). Don't treat these as real integrations.
+
+## Daily.co rooms
+`daily.ts` is a real integration (key from `DAILY_API_KEY`; all failures soft-fail and
+are logged). Room policy lives in `resolveChosenLocation` (create-booking-handler.ts):
+a pre-configured `url` on the event type's menu entry wins; else `DAILY_DEFAULT_ROOM_URL`;
+else a per-booking room is minted (name = booking uid, join window = slot ±
+`DAILY_ROOM_GRACE_SECONDS`). Minting happens BEFORE the write transaction (never hold
+the write lock for an API call) and is idempotent by room name (duplicate → GET
+recovery). Only MINTED rooms carry the `dailyRoomName` marker in `bookings.location`;
+`cancelBookingHandler` best-effort deletes only those. Rooms self-expire via nbf/exp.

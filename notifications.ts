@@ -9,6 +9,8 @@ export type ChosenLocation = {
   phone?: string;
   displayPhone?: string;
   url?: string;
+  /** Present only when the room was minted for this booking — provenance for cancel-time teardown. */
+  dailyRoomName?: string;
   // allow passthrough fields from event_types.locations
   [key: string]: unknown;
 };
@@ -19,6 +21,9 @@ export type ChosenLocation = {
 const BUSINESS_ADDRESS = process.env.BUSINESS_ADDRESS ?? "";
 const BUSINESS_MAPS_URL = process.env.BUSINESS_MAPS_URL ?? "";
 const BUSINESS_PHONE = process.env.BUSINESS_PHONE ?? "";
+// Venue line for in-person bookings (e.g. "In person — <venue>"). Neutral
+// fallback when unset — real venue names are env config, not code.
+const BUSINESS_LOCATION_LABEL = process.env.BUSINESS_LOCATION_LABEL ?? "In person";
 
 function escapeHtml(s: string): string {
   return s
@@ -46,7 +51,7 @@ export function locationBlockText(loc: ChosenLocation, guestPhone?: string | nul
     case "inPerson": {
       const addr = (loc.address as string) ?? BUSINESS_ADDRESS;
       const mapsUrl = safeHttpsUrl(BUSINESS_MAPS_URL);
-      const parts = ["In person — Brick House Blue, Hilliard"];
+      const parts = [BUSINESS_LOCATION_LABEL];
       if (addr) parts.push(addr);
       if (mapsUrl) parts.push(`Map: ${mapsUrl}`);
       if (!addr && !mapsUrl) parts.push("Contact us for location details.");
@@ -72,7 +77,7 @@ export function locationBlockHtml(loc: ChosenLocation, guestPhone?: string | nul
     case "inPerson": {
       const addr = (loc.address as string) ?? BUSINESS_ADDRESS;
       const mapsUrl = safeHttpsUrl(BUSINESS_MAPS_URL);
-      let html = `<p>In person — Brick House Blue, Hilliard`;
+      let html = `<p>${escapeHtml(BUSINESS_LOCATION_LABEL)}`;
       if (addr) html += `<br>${escapeHtml(addr)}`;
       if (mapsUrl) html += `<br><a href="${escapeHtml(mapsUrl)}">View map</a>`;
       if (!addr && !mapsUrl) html += `<br>Contact us for location details.`;

@@ -3,7 +3,7 @@ import { and, eq, gt, inArray, isNull, lt, max, sql } from "drizzle-orm";
 import { LibSQLDatabase } from "drizzle-orm/libsql";
 import { DateTime } from "luxon";
 import { z } from "zod";
-import { createDailyRoom } from "./daily";
+import { createDailyRoom, deleteDailyRoom } from "./daily";
 import { sendBookingConfirmation, type ChosenLocation } from "./notifications";
 import {
   AvailabilityRepository,
@@ -413,7 +413,7 @@ export async function cancelBookingHandler(db: AppDb, rawInput: CancelBookingInp
     throw new Error("cancelBookingHandler requires uid or idempotencyKey");
   }
 
-  return await db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx) => {
     const match = rawInput.uid
       ? eq(bookings.uid, rawInput.uid)
       : eq(bookings.idempotencyKey, rawInput.idempotencyKey!);
@@ -455,6 +455,19 @@ export async function cancelBookingHandler(db: AppDb, rawInput: CancelBookingInp
       false
     );
   });
+
+  // Best-effort teardown of a MINTED per-booking room. Pre-configured rooms
+  // never carry dailyRoomName, and replays were already torn down on the
+  // first cancel — both are skipped here. Rooms also self-expire via nbf/exp,
+  // so a teardown failure only leaves the join window open until exp.
+  const roomName = result.location.dailyRoomName;
+  if (!result.replay && typeof roomName === "string" && roomName.length > 0) {
+    const deleted = await deleteDailyRoom(roomName);
+    if (!deleted) {
+      logWarn("daily_room_teardown_incomplete", { uid: result.uid, roomName });
+    }
+  }
+  return result;
 }
 
 /** Safety net: ticks whose booking row is gone would block a host's slot forever. */
@@ -473,66 +486,142 @@ export async function findOrphanedTicks(
   return rows;
 }
 
+/**
+ * Resolves the booking's chosen location BEFORE the write transaction opens:
+ * 1. a pre-configured `url` on the event type's menu entry wins — used
+ *    verbatim, never minted, never torn down (it is a shared permanent room);
+ * 2. else DAILY_DEFAULT_ROOM_URL, if set;
+ * 3. else a per-booking room is minted (name = uid, join window = slot ±
+ *    grace). Mint failure soft-fails: the booking proceeds with
+ *    "link to follow" and the failure is logged.
+ * The menu read + validation happening outside the tx is safe: the menu is
+ * presentation config, not conflict data — conflict correctness lives in the
+ * tick index and the buffered-overlap check inside the transaction.
+ * Minting before the tx keeps the Daily API round-trip out of the write lock.
+ */
+async function resolveChosenLocation(
+  db: AppDb,
+  input: CreateBookingInput,
+  uid: string,
+  slotStartUtc: string,
+  slotEndUtc: string
+): Promise<ChosenLocation> {
+  const [etRow] = await db
+    .select({ locations: schema.eventTypes.locations })
+    .from(schema.eventTypes)
+    .where(eq(schema.eventTypes.id, input.eventTypeId))
+    .limit(1);
+  const menu = parseLocationsColumn(etRow?.locations);
+  const menuEntry = menu.find((m) => m.type === input.location.type);
+  if (!menuEntry) {
+    throw new LocationNotOfferedError(
+      `location type ${input.location.type} is not offered by event type ${input.eventTypeId}`,
+    );
+  }
+  // Strip a menu-provided dailyRoomName: only rooms minted for THIS booking
+  // may be torn down at cancel time — a shared/permanent room must never be
+  // deleted because its menu JSON happened to carry the field.
+  const { dailyRoomName: _menuRoomName, ...menuRest } = menuEntry;
+  const chosen: ChosenLocation = { ...menuRest };
+  if (input.location.type !== "integrations:daily") return chosen;
+
+  if (typeof chosen.url === "string" && chosen.url.length > 0) {
+    return chosen;
+  }
+  const defaultRoom = process.env.DAILY_DEFAULT_ROOM_URL;
+  if (defaultRoom) return { ...chosen, url: defaultRoom };
+
+  const nbf = Math.floor(DateTime.fromISO(slotStartUtc, { zone: "utc" }).toMillis() / 1000);
+  const graceSeconds = Number(process.env.DAILY_ROOM_GRACE_SECONDS ?? 3600);
+  const exp = Math.floor(DateTime.fromISO(slotEndUtc, { zone: "utc" }).toMillis() / 1000) + graceSeconds;
+  const url = await createDailyRoom(uid, nbf, exp);
+  if (!url) return chosen;
+  // dailyRoomName marks the room as MINTED — the only kind cancel teardown deletes.
+  return { ...chosen, url, dailyRoomName: uid };
+}
+
+/** Deletes the attempt's minted room when the booking was NOT persisted under it. */
+async function teardownMintedRoom(chosen: ChosenLocation, uid: string): Promise<void> {
+  if (typeof chosen.dailyRoomName === "string" && chosen.dailyRoomName.length > 0) {
+    const deleted = await deleteDailyRoom(chosen.dailyRoomName);
+    if (!deleted) {
+      logWarn("daily_room_teardown_incomplete", { uid, roomName: chosen.dailyRoomName });
+    }
+  }
+}
+
 export async function createBookingHandler(db: AppDb, rawInput: unknown): Promise<BookingResult> {
   const input = CreateBookingInput.parse(rawInput);
   const slotStartUtc = toUtcIso(input.slotStartUtc);
   const slotEndUtc = toUtcIso(input.slotEndUtc);
 
+  // Fast replay path: a booking that already exists under this idempotency key
+  // carries its own room — return it without minting anything. (The insert-time
+  // replay below still handles the race where a concurrent first request
+  // commits after this check.)
+  const preexisting = await replayExistingBooking(db, input.idempotencyKey);
+  if (preexisting) return preexisting;
+
+  // uid and the video room are resolved once, before any attempt: retries
+  // reuse the same room name (duplicate-name recovery makes mint idempotent),
+  // and no API call runs inside the write transaction.
+  const uid = randomUUID();
+  const chosen = await resolveChosenLocation(db, input, uid, slotStartUtc, slotEndUtc);
+
   const maxAttempts = 16;
   let lastErr: unknown;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const result = await commitBooking(db, input, slotStartUtc, slotEndUtc);
-      // Availability unchanged by location; only confirmation differs.
-      // Fire-and-forget, but failures are logged (with uid), not swallowed.
-      void sendBookingConfirmation({ result, guestPhone: result.attendee.phone ?? null }).catch((err) => {
-        logWarn("booking_confirmation_failed", { uid: result.uid, error: errorText(err) });
-      });
-      return result;
-    } catch (err) {
-      lastErr = err;
-      if (isSqliteBusy(err) && attempt < maxAttempts - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
-        continue;
+  let persisted = false;
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const result = await commitBooking(db, input, uid, chosen, slotStartUtc, slotEndUtc);
+        // Availability unchanged by location; only confirmation differs.
+        // Fire-and-forget, but failures are logged (with uid), not swallowed.
+        void sendBookingConfirmation({ result, guestPhone: result.attendee.phone ?? null }).catch((err) => {
+          logWarn("booking_confirmation_failed", { uid: result.uid, error: errorText(err) });
+        });
+        persisted = true;
+        return result;
+      } catch (err) {
+        lastErr = err;
+        if (isSqliteBusy(err) && attempt < maxAttempts - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+          continue;
+        }
+
+        const violation = classifyUniqueViolation(err);
+
+        if (violation === "idempotency_key") {
+          const existing = await replayExistingBooking(db, input.idempotencyKey);
+          if (existing) return existing;
+        }
+
+        if (violation === "host_slot") {
+          throw new SlotConflictError(`Slot ${slotStartUtc}–${slotEndUtc} was taken by a concurrent request`);
+        }
+
+        throw err;
       }
-
-      const violation = classifyUniqueViolation(err);
-
-      if (violation === "idempotency_key") {
-        const existing = await replayExistingBooking(db, input.idempotencyKey);
-        if (existing) return existing;
-      }
-
-      if (violation === "host_slot") {
-        throw new SlotConflictError(`Slot ${slotStartUtc}–${slotEndUtc} was taken by a concurrent request`);
-      }
-
-      throw err;
     }
+    throw lastErr;
+  } finally {
+    // Any terminal path that did not persist the booking under this attempt's
+    // room (replay, conflict, exhausted retries, unexpected error) must not
+    // leak the minted room — it would otherwise linger until exp.
+    if (!persisted) await teardownMintedRoom(chosen, uid);
   }
-  throw lastErr;
 }
 
 async function commitBooking(
   db: AppDb,
   input: CreateBookingInput,
+  uid: string,
+  chosen: ChosenLocation,
   slotStartUtc: string,
   slotEndUtc: string
 ): Promise<BookingResult> {
   return await db.transaction(async (tx) => {
       const eventType = await loadEventType(tx, input.eventTypeId);
-      const [etRow] = await tx
-        .select({ locations: schema.eventTypes.locations })
-        .from(schema.eventTypes)
-        .where(eq(schema.eventTypes.id, input.eventTypeId))
-        .limit(1);
-      const menu = parseLocationsColumn(etRow?.locations);
-      const menuEntry = menu.find((m) => m.type === input.location.type);
-      if (!menuEntry) {
-        throw new LocationNotOfferedError(
-          `location type ${input.location.type} is not offered by event type ${input.eventTypeId}`,
-        );
-      }
       const repo = makeTxRepository(tx);
 
       const primaryHostId = eventType.hostUserIds[0];
@@ -574,15 +663,6 @@ async function commitBooking(
         attendingHostUserIds = [hostUserId];
       }
 
-      const uid = randomUUID();
-      // Build chosen location; for Daily, mint room with nbf/exp around slot.
-      let chosen: ChosenLocation = { ...menuEntry };
-      if (input.location.type === "integrations:daily") {
-        const nbf = Math.floor(DateTime.fromISO(slotStartUtc, { zone: "utc" }).toMillis() / 1000);
-        const exp = Math.floor(DateTime.fromISO(slotEndUtc, { zone: "utc" }).toMillis() / 1000) + 3600;
-        const url = await createDailyRoom(uid, nbf, exp);
-        if (url) chosen = { ...chosen, url };
-      }
       const [inserted] = await tx
         .insert(bookings)
         .values({

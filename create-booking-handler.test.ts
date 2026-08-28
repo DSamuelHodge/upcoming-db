@@ -13,13 +13,14 @@ import {
 } from "./create-booking-handler";
 import { InvalidJsonColumnError } from "./json-columns";
 import { eq } from "drizzle-orm";
+import { getDailyRoomUrl } from "./daily";
 import { loadEventType } from "./event-types";
 import { attendees, availability, bookings, eventTypeHosts, eventTypes, schedules, users } from "./schema";
 import { openDb, openTestDb } from "./test-db";
 
 const LOCATIONS_JSON = JSON.stringify([
   { type: "integrations:daily", label: "Video (Daily.co)" },
-  { type: "inPerson", label: "In person — Brick House Blue, Hilliard", address: "[REDACTED_ADDRESS]" },
+  { type: "inPerson", label: "In person", address: "[REDACTED_ADDRESS]" },
   { type: "userPhone", label: "Phone", phone: "+15555550100", displayPhone: "(555) 555-0100" },
 ]);
 
@@ -103,7 +104,15 @@ async function seedIndividual(db: Awaited<ReturnType<typeof openTestDb>>["db"], 
   await db.insert(eventTypeHosts).values({ eventTypeId: id, hostUserId, priority: 0 });
 }
 
-function bookingInput(partial: Partial<typeof base> & { slotStartUtc: string; slotEndUtc: string; idempotencyKey: string; eventTypeId?: number; location?: { type: string } }) {
+function bookingInput(
+  partial: Partial<Omit<typeof base, "location">> & {
+    slotStartUtc: string;
+    slotEndUtc: string;
+    idempotencyKey: string;
+    eventTypeId?: number;
+    location?: { type: "integrations:daily" | "inPerson" | "userPhone" };
+  }
+) {
   return {
     eventTypeId: 1,
     location: { type: "inPerson" },
@@ -495,6 +504,127 @@ test("malformed event_types.locations fails loudly instead of rejecting every lo
       InvalidJsonColumnError
     );
   } finally {
+    close();
+  }
+});
+
+// --- Live Daily.co flow tests (self-skip without DAILY_API_KEY) ---
+
+const liveDaily = process.env.DAILY_API_KEY;
+const dailyTest = (name: string, fn: (t: { skip: (msg?: string) => void }) => Promise<void>) =>
+  test(name, { skip: !liveDaily && "Set DAILY_API_KEY to run live Daily.co flow tests" }, fn);
+
+dailyTest("booking with integrations:daily mints a real room; cancel tears it down", async (t) => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    const result = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "daily-live-1",
+        location: { type: "integrations:daily" },
+      })
+    );
+    assert.ok(result.location.url, "minted room must be stored on the booking");
+    assert.equal(result.location.dailyRoomName, result.uid, "provenance marker = booking uid");
+    const roomName = result.location.dailyRoomName as string;
+    assert.ok(await getDailyRoomUrl(roomName), "room must actually exist on Daily");
+
+    const cancelled = await cancelBookingHandler(db, { uid: result.uid });
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(await getDailyRoomUrl(roomName), null, "cancel must delete the minted room");
+  } finally {
+    close();
+  }
+});
+
+dailyTest("pre-configured menu url wins and no room is minted", async (t) => {
+  const { db, close } = await openTestDb();
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    const preconfigured = `https://example.daily.co/permanent-${Date.now()}`;
+    await db
+      .update(eventTypes)
+      .set({
+        locations: JSON.stringify([
+          { type: "integrations:daily", label: "Video", url: preconfigured },
+          { type: "inPerson", label: "In person", address: "[REDACTED_ADDRESS]" },
+        ]),
+      })
+      .where(eq(eventTypes.id, 1));
+
+    const result = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "daily-preconfigured-1",
+        location: { type: "integrations:daily" },
+      })
+    );
+    assert.equal(result.location.url, preconfigured, "menu url must be used verbatim");
+    assert.equal(result.location.dailyRoomName, undefined, "pre-configured rooms carry no mint marker");
+    assert.equal(
+      await getDailyRoomUrl(result.uid),
+      null,
+      "no per-booking room may be minted when the menu provides one"
+    );
+  } finally {
+    close();
+  }
+});
+
+dailyTest("menu-provided dailyRoomName on a pre-configured room is ignored at cancel", async (t) => {
+  const { createDailyRoom, deleteDailyRoom } = await import("./daily");
+  const { db, close } = await openTestDb();
+  // A real shared room that must survive the booking's cancellation.
+  const sharedName = `shared-${Date.now()}`;
+  const sharedUrl = await createDailyRoom(sharedName, 0, Math.floor(Date.now() / 1000) + 3600);
+  if (!sharedUrl) {
+    close();
+    t.skip("Daily room creation failed");
+    return;
+  }
+  try {
+    await seedUsersAndHours(db);
+    await seedIndividual(db);
+    // Menu JSON smuggles a dailyRoomName — it must never be treated as
+    // booking-owned, otherwise cancel would delete the shared room.
+    await db
+      .update(eventTypes)
+      .set({
+        locations: JSON.stringify([
+          { type: "integrations:daily", label: "Video", url: sharedUrl, dailyRoomName: sharedName },
+          { type: "inPerson", label: "In person", address: "[REDACTED_ADDRESS]" },
+        ]),
+      })
+      .where(eq(eventTypes.id, 1));
+
+    const result = await createBookingHandler(
+      db,
+      bookingInput({
+        slotStartUtc: "2027-06-01T10:00:00.000Z",
+        slotEndUtc: "2027-06-01T11:00:00.000Z",
+        idempotencyKey: "daily-shared-room-1",
+        location: { type: "integrations:daily" },
+      })
+    );
+    assert.equal(result.location.url, sharedUrl);
+    assert.equal(result.location.dailyRoomName, undefined, "menu-injected marker must be stripped");
+
+    const cancelled = await cancelBookingHandler(db, { uid: result.uid });
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(
+      await getDailyRoomUrl(sharedName),
+      sharedUrl,
+      "the shared room must survive the booking's cancellation"
+    );
+  } finally {
+    await deleteDailyRoom(sharedName);
     close();
   }
 });
