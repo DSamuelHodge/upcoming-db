@@ -1,5 +1,6 @@
 import { DateTime } from "luxon";
 import type { BookingResult } from "./create-booking-handler";
+import { logInfo } from "./logger";
 
 export type ChosenLocation = {
   type: "integrations:daily" | "inPerson" | "userPhone";
@@ -118,5 +119,5 @@ export function buildConfirmationEmail(input: ConfirmationInput): { subject: str
 export async function sendBookingConfirmation(input: ConfirmationInput): Promise<void> {
   const { subject, text, html } = buildConfirmationEmail(input);
   // TODO: wire AgentMail send here. For now, log so behavior is visible and testable.
-  console.log(`[AgentMail] ${subject}\n${text}\n---HTML---\n${html}`);
+  logInfo("agentmail_stub_send", { subject, text, html });
 }
