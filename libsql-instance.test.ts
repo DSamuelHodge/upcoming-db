@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createClient } from "@libsql/client";
+import { Client, createClient } from "@libsql/client";
 import { drizzle } from "drizzle-orm/libsql";
 import { Table, getTableName } from "drizzle-orm";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
@@ -72,6 +72,51 @@ test("test harness enforces event_type_owner_slug_unique", async () => {
     close();
   }
 });
+
+// Removes every fixture row a live test inserted for its synthetic user, in
+// FK-safe dependency order. Used by the live tests' finally blocks so repeated
+// runs do not accumulate rows in the remote database.
+async function deleteLiveFixtures(client: Client, userId: number): Promise<void> {
+  const bookings = await client.execute({
+    sql: "SELECT id FROM bookings WHERE host_user_id = ?",
+    args: [userId],
+  });
+  for (const row of bookings.rows) {
+    const bookingId = Number(row.id);
+    await client.execute({ sql: "DELETE FROM attendees WHERE booking_id = ?", args: [bookingId] });
+    await client.execute({
+      sql: "DELETE FROM host_occupancy_ticks WHERE booking_id = ?",
+      args: [bookingId],
+    });
+    await client.execute({ sql: "DELETE FROM booking_hosts WHERE booking_id = ?", args: [bookingId] });
+    await client.execute({ sql: "DELETE FROM bookings WHERE id = ?", args: [bookingId] });
+  }
+
+  const eventTypes_ = await client.execute({
+    sql: "SELECT id FROM event_types WHERE owner_user_id = ?",
+    args: [userId],
+  });
+  for (const row of eventTypes_.rows) {
+    const eventTypeId = Number(row.id);
+    await client.execute({
+      sql: "DELETE FROM event_type_hosts WHERE event_type_id = ?",
+      args: [eventTypeId],
+    });
+    await client.execute({ sql: "DELETE FROM event_types WHERE id = ?", args: [eventTypeId] });
+  }
+
+  const scheds = await client.execute({
+    sql: "SELECT id FROM schedules WHERE user_id = ?",
+    args: [userId],
+  });
+  for (const row of scheds.rows) {
+    const scheduleId = Number(row.id);
+    await client.execute({ sql: "DELETE FROM availability WHERE schedule_id = ?", args: [scheduleId] });
+    await client.execute({ sql: "DELETE FROM schedules WHERE id = ?", args: [scheduleId] });
+  }
+
+  await client.execute({ sql: "DELETE FROM users WHERE id = ?", args: [userId] });
+}
 
 test("LibSQL/Turso instance has the applied schema", async (t) => {
   if (!isLibsqlInstance(url)) {
@@ -172,6 +217,17 @@ test("createBookingHandler writes through the LibSQL instance", async (t) => {
     });
     assert.equal(Number(ticks.rows[0]!.n) > 0, true);
   } finally {
+    try {
+      const userRows = await client.execute({
+        sql: "SELECT id FROM users WHERE username = ?",
+        args: [`live-${suffix}`],
+      });
+      if (userRows.rows.length > 0) {
+        await deleteLiveFixtures(client, Number(userRows.rows[0]!.id));
+      }
+    } catch (error) {
+      console.warn("live fixture cleanup failed:", error);
+    }
     client.close();
   }
 });
@@ -280,6 +336,17 @@ test("two clients contending for one slot on live Turso: one booking, one 409", 
     });
     assert.equal(Number(tickCount.rows[0]!.n), 60, "exactly 60 occupancy ticks must exist");
   } finally {
+    try {
+      const userRows = await client.execute({
+        sql: "SELECT id FROM users WHERE username = ?",
+        args: [`live-${suffix}`],
+      });
+      if (userRows.rows.length > 0) {
+        await deleteLiveFixtures(client, Number(userRows.rows[0]!.id));
+      }
+    } catch (error) {
+      console.warn("live fixture cleanup failed:", error);
+    }
     client.close();
     client2.close();
   }
