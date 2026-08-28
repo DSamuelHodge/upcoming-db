@@ -181,7 +181,7 @@ and a production footgun:
 (`daily.ts:30-33`) — that's the correct no-key behavior; keep it and drop the loader.
 
 ### 5.2 Hardcoded address/phone in `notifications.ts`
-`4022 Green Stripe Lane, Hilliard, OH 43026`, a `MAPS_URL`, and `(614) 407-4920` are
+`[REDACTED_ADDRESS]`, a `MAPS_URL`, and `[REDACTED_PHONE]` are
 hardcoded as fallbacks (`notifications.ts:15, 22, 26, 41, 45`). Business/PII-ish config
 belongs in configuration, not source. They're only used when `loc.address`/`loc.phone` is
 absent, but defaults still shouldn't ship in code.
