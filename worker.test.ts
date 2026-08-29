@@ -405,3 +405,21 @@ test("PATCH /me/schedule updates schedule and keeps users.timezone in lockstep",
     close();
   }
 });
+
+test("metadata contract accepts the seeded role/company profile context", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    await db.update(users).set({ metadata: '{"role":"Product Lead","company":"Upcoming Labs"}' }).where(eq(users.id, 1));
+    const app = appWith(db);
+    const res = await app.request("/me", authed(""));
+    assert.equal((await res.json()).metadata.company, "Upcoming Labs");
+    const patch = await app.request(
+      "/me",
+      authed("", { method: "PATCH", body: JSON.stringify({ metadata: { role: "Founder", company: "ACME" } }) })
+    );
+    assert.equal((await patch.json()).metadata.role, "Founder");
+  } finally {
+    close();
+  }
+});

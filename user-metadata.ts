@@ -18,6 +18,9 @@ export const UserMetadata = z
       .object({ timeFormat: z.enum(["12h", "24h"]) })
       .strict()
       .optional(),
+    // Profile context (populated by seed data, rendered by clients).
+    role: z.string().max(120).optional(),
+    company: z.string().max(120).optional(),
   })
   .strict();
 
