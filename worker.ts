@@ -20,6 +20,7 @@ import {
 import { EventTypeNotFoundError, loadEventType } from "./event-types";
 import { computeMultiHostAvailability } from "./multi-host-routing";
 import { UserMetadata, parseUserMetadata, stringifyUserMetadata } from "./user-metadata";
+import { encryptToken, decryptToken } from "./crypto";
 import { z } from "zod";
 
 export interface WorkerEnv {
@@ -325,6 +326,99 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       });
       const [updated] = await db.select().from(schema.users).where(eq(schema.users.id, target.user.id)).limit(1);
       return meResponse(updated);
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // User credentials (/me/credentials) — bring-your-own API keys and private
+  // URLs (Daily.co key, iCal/CalDAV URLs, Stripe key, ...). Stored AES-256-GCM
+  // envelope-encrypted in the credentials table; reads return masked hints
+  // only — plaintext never leaves this process after the write.
+  // ---------------------------------------------------------------------------
+
+  const CREDENTIAL_TYPES = ["daily_api_key", "ical_url", "caldav_url", "stripe_secret_key"] as const;
+
+  const maskSecret = (value: string): string => {
+    if (value.length <= 4) return "••••";
+    return `••••${value.slice(-4)}`;
+  };
+
+  app.get(
+    "/me/credentials",
+    guarded(async (c) => {
+      const target = await loadTargetUser(c);
+      if (target.error) return target.error;
+      const rows = await db
+        .select({ type: schema.credentials.type, encryptedToken: schema.credentials.encryptedToken })
+        .from(schema.credentials)
+        .where(eq(schema.credentials.userId, target.user.id));
+      return Response.json(
+        rows.map((row) => {
+          let hint = "••••";
+          try {
+            hint = maskSecret(decryptToken(row.encryptedToken));
+          } catch {
+            // Undecryptable (e.g. key rotated) — keep the generic mask.
+          }
+          return { type: row.type, hint };
+        })
+      );
+    })
+  );
+
+  app.put(
+    "/me/credentials/:type",
+    guarded(async (c) => {
+      const target = await loadTargetUser(c);
+      if (target.error) return target.error;
+      const type = c.req.param("type") ?? "";
+      if (!(CREDENTIAL_TYPES as readonly string[]).includes(type)) {
+        return Response.json({ error: `unknown credential type: ${type}` }, { status: 400 });
+      }
+      let body: { value: string };
+      try {
+        body = z.object({ value: z.string().min(1).max(4096) }).strict().parse(await c.req.json());
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          return Response.json({ error: "body must be { value: string }" }, { status: 400 });
+        }
+        throw err;
+      }
+      // Light format validation per type — loud, but not a deep integration check.
+      if (type === "ical_url" || type === "caldav_url") {
+        if (!/^https?:\/\//.test(body.value)) {
+          return Response.json({ error: `${type} must be an http(s) URL` }, { status: 400 });
+        }
+      }
+      const encrypted = encryptToken(body.value);
+      const [existing] = await db
+        .select({ id: schema.credentials.id })
+        .from(schema.credentials)
+        .where(and(eq(schema.credentials.userId, target.user.id), eq(schema.credentials.type, type)))
+        .limit(1);
+      if (existing) {
+        await db.update(schema.credentials).set({ encryptedToken: encrypted }).where(eq(schema.credentials.id, existing.id));
+      } else {
+        await db.insert(schema.credentials).values({ userId: target.user.id, type, encryptedToken: encrypted });
+      }
+      return Response.json({ type, hint: maskSecret(body.value) });
+    })
+  );
+
+  app.delete(
+    "/me/credentials/:type",
+    guarded(async (c) => {
+      const target = await loadTargetUser(c);
+      if (target.error) return target.error;
+      const type = c.req.param("type") ?? "";
+      const deleted = await db
+        .delete(schema.credentials)
+        .where(and(eq(schema.credentials.userId, target.user.id), eq(schema.credentials.type, type)))
+        .returning({ id: schema.credentials.id });
+      if (deleted.length === 0) {
+        return Response.json({ error: "credential not found" }, { status: 404 });
+      }
+      return Response.json({ deleted: type });
     })
   );
 

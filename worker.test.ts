@@ -275,7 +275,7 @@ test("GET /me returns the primary user with schedule and parsed metadata", async
   try {
     await seed(db);
     const app = appWith(db);
-    const res = await app.request("/me", authed());
+    const res = await app.request("/me", authed(""));
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.id, 1);
@@ -292,15 +292,15 @@ test("GET /me 404s when no users exist; ?userId= selects a specific user", async
   const { db, close } = await openTestDb();
   try {
     const app = appWith(db);
-    const missing = await app.request("/me", authed());
+    const missing = await app.request("/me", authed(""));
     assert.equal(missing.status, 404);
     await db.insert(users).values([
       { id: 1, email: "a@x.test", username: "a", timezone: "UTC" },
       { id: 2, email: "b@x.test", username: "b", timezone: "UTC" },
     ]);
-    const targeted = await app.request("/me?userId=2", authed());
+    const targeted = await app.request("/me?userId=2", authed(""));
     assert.equal((await targeted.json()).username, "b");
-    const badParam = await app.request("/me?userId=nope", authed());
+    const badParam = await app.request("/me?userId=nope", authed(""));
     assert.equal(badParam.status, 400);
   } finally {
     close();
@@ -419,6 +419,96 @@ test("metadata contract accepts the seeded role/company profile context", async 
       authed("", { method: "PATCH", body: JSON.stringify({ metadata: { role: "Founder", company: "ACME" } }) })
     );
     assert.equal((await patch.json()).metadata.role, "Founder");
+  } finally {
+    close();
+  }
+});
+
+test("metadata contract: per-type location defaults + defaultLocationType", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+    const patch = await app.request(
+      "/me",
+      authed("", {
+        method: "PATCH",
+        body: JSON.stringify({
+          metadata: {
+            locations: {
+              "integrations:daily": { type: "integrations:daily", label: "My Room", url: "https://team.daily.co/perm" },
+              inPerson: { type: "inPerson", label: "Office", address: "[REDACTED_ADDRESS]" },
+              userPhone: { type: "userPhone", label: "Cell", phone: "+15555550123" },
+            },
+            defaultLocationType: "inPerson",
+          },
+        }),
+      })
+    );
+    assert.equal(patch.status, 200);
+    const body = await patch.json();
+    assert.equal(body.metadata.locations.inPerson.label, "Office");
+    assert.equal(body.metadata.defaultLocationType, "inPerson");
+    // Unknown defaultLocationType rejected.
+    const bad = await app.request(
+      "/me",
+      authed("", { method: "PATCH", body: JSON.stringify({ metadata: { defaultLocationType: "carrierPigeon" } }) })
+    );
+    assert.equal(bad.status, 400);
+  } finally {
+    close();
+  }
+});
+
+test("credentials: put/replace/list(masked)/delete round-trip", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    process.env.TOKEN_ENCRYPTION_KEY = "a".repeat(64);
+    const app = appWith(db);
+    try {
+      const put = await app.request(
+        "/me/credentials/daily_api_key",
+        authed("", { method: "PUT", body: JSON.stringify({ value: "daily-key-abcd1234" }) })
+      );
+      assert.equal(put.status, 200);
+      assert.equal((await put.json()).hint, "••••1234");
+
+      // Replace keeps one row.
+      await app.request(
+        "/me/credentials/daily_api_key",
+        authed("", { method: "PUT", body: JSON.stringify({ value: "daily-key-xyz9999" }) })
+      );
+
+      // Unknown type is 400; bad URL is 400.
+      assert.equal(
+        (await app.request("/me/credentials/nope", authed("", { method: "PUT", body: '{"value":"x"}' }))).status,
+        400
+      );
+      assert.equal(
+        (
+          await app.request(
+            "/me/credentials/ical_url",
+            authed("", { method: "PUT", body: '{"value":"not-a-url"}' })
+          )
+        ).status,
+        400
+      );
+
+      // List returns hints only — ciphertext never leaks.
+      const list = await app.request("/me/credentials", authed(""));
+      const rows = (await list.json()) as Array<{ type: string; hint: string }>;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].hint, "••••9999");
+      assert.ok(!JSON.stringify(rows).includes("daily-key"));
+
+      const del = await app.request("/me/credentials/daily_api_key", authed("", { method: "DELETE" }));
+      assert.equal(del.status, 200);
+      const delAgain = await app.request("/me/credentials/daily_api_key", authed("", { method: "DELETE" }));
+      assert.equal(delAgain.status, 404);
+    } finally {
+      delete process.env.TOKEN_ENCRYPTION_KEY;
+    }
   } finally {
     close();
   }
