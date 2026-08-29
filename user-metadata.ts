@@ -19,6 +19,15 @@ export const LocationDefaults = z
   })
   .strict();
 
+// Pre-meeting reminder offsets, in minutes before the meeting starts. Stored
+// sorted ascending (soonest first), deduped, capped at 5 entries — matching the
+// client's reminder-list editor. Absent means the client applies its own
+// default ([10]).
+export const ReminderOffsets = z
+  .array(z.number().int().min(1).max(10080))
+  .max(5)
+  .transform((list) => Array.from(new Set(list)).sort((a, b) => a - b));
+
 export const UserMetadata = z
   .object({
     // Per-type booking-default locations.
@@ -29,7 +38,11 @@ export const UserMetadata = z
     // still accepted so older writers keep validating).
     defaultLocation: LocationEntry.optional(),
     prefs: z
-      .object({ timeFormat: z.enum(["12h", "24h"]) })
+      .object({
+        timeFormat: z.enum(["12h", "24h"]),
+        // Pre-meeting reminder lead times in minutes (see ReminderOffsets).
+        reminderOffsets: ReminderOffsets.optional(),
+      })
       .strict()
       .optional(),
     // Profile context (populated by seed data, rendered by clients).
@@ -40,6 +53,10 @@ export const UserMetadata = z
 
 export type UserMetadataValue = z.infer<typeof UserMetadata>;
 export type LocationEntryValue = z.infer<typeof LocationEntry>;
+export type UserPrefsValue = NonNullable<UserMetadataValue["prefs"]>;
+
+// Client-facing defaults for reminder settings when metadata carries none.
+export const DEFAULT_REMINDER_OFFSETS = [10] as const;
 
 // Returns the parsed metadata value or throws (ZodError) — loud on purpose.
 export function parseUserMetadata(raw: string): UserMetadataValue {

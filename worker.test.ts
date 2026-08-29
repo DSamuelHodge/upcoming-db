@@ -344,6 +344,45 @@ test("PATCH /me updates profile fields and validates input", async () => {
         .status,
       400
     );
+    // Bad reminder offsets rejected (zero/negative, non-integer, too many).
+    for (const bad of ["0", "-5", "9.5", "10081", '"10"']) {
+      const res = await app.request(
+        "/me",
+        authed("", { method: "PATCH", body: `{"metadata":{"prefs":{"timeFormat":"24h","reminderOffsets":[${bad}]}}}` })
+      );
+      assert.equal(res.status, 400, `reminderOffsets ${bad} should be rejected`);
+    }
+  } finally {
+    close();
+  }
+});
+
+test("metadata contract: reminder offsets normalize (dedupe, sort, cap)", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+    const res = await app.request(
+      "/me",
+      authed("", {
+        method: "PATCH",
+        body: JSON.stringify({ metadata: { prefs: { timeFormat: "12h", reminderOffsets: [60, 10, 60, 1440] } } }),
+      })
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    // Sorted ascending, deduped.
+    assert.deepEqual(body.metadata.prefs.reminderOffsets, [10, 60, 1440]);
+
+    // More than 5 distinct offsets is rejected.
+    const tooMany = await app.request(
+      "/me",
+      authed("", {
+        method: "PATCH",
+        body: JSON.stringify({ metadata: { prefs: { timeFormat: "12h", reminderOffsets: [1, 2, 3, 4, 5, 6] } } }),
+      })
+    );
+    assert.equal(tooMany.status, 400);
   } finally {
     close();
   }
