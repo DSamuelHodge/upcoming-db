@@ -265,3 +265,143 @@ test("attendee notes column round-trips through the read path", async () => {
     close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// /me — user settings (profile, timezone, metadata contract)
+// ---------------------------------------------------------------------------
+
+test("GET /me returns the primary user with schedule and parsed metadata", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+    const res = await app.request("/me", authed());
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.id, 1);
+    assert.equal(body.email, "host@x.test");
+    assert.equal(body.displayName, "Host");
+    assert.deepEqual(body.metadata, {});
+    assert.deepEqual(body.schedule, { id: 1, name: "Hours", timezone: "UTC" });
+  } finally {
+    close();
+  }
+});
+
+test("GET /me 404s when no users exist; ?userId= selects a specific user", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    const app = appWith(db);
+    const missing = await app.request("/me", authed());
+    assert.equal(missing.status, 404);
+    await db.insert(users).values([
+      { id: 1, email: "a@x.test", username: "a", timezone: "UTC" },
+      { id: 2, email: "b@x.test", username: "b", timezone: "UTC" },
+    ]);
+    const targeted = await app.request("/me?userId=2", authed());
+    assert.equal((await targeted.json()).username, "b");
+    const badParam = await app.request("/me?userId=nope", authed());
+    assert.equal(badParam.status, 400);
+  } finally {
+    close();
+  }
+});
+
+test("PATCH /me updates profile fields and validates input", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+    const res = await app.request(
+      "/me",
+      authed("", { method: "PATCH",
+        body: JSON.stringify({
+          displayName: "Alex Rivera",
+          avatarUrl: "https://cdn.example/avatar.png",
+          metadata: {
+            defaultLocation: { type: "userPhone", label: "My phone", phone: "+15555550123" },
+            prefs: { timeFormat: "24h" },
+          },
+        }),
+      })
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.displayName, "Alex Rivera");
+    assert.equal(body.metadata.defaultLocation.type, "userPhone");
+    assert.equal(body.metadata.prefs.timeFormat, "24h");
+
+    // Empty patch is 400; unknown fields rejected; bad timezone rejected.
+    assert.equal((await app.request("/me", authed("", { method: "PATCH", body: "{}" }))).status, 400);
+    assert.equal((await app.request("/me", authed("", { method: "PATCH", body: '{"nope":1}' }))).status, 400);
+    assert.equal(
+      (await app.request("/me", authed("", { method: "PATCH", body: '{"timezone":"Mars/Olympus"}' }))).status,
+      400
+    );
+    // Bad metadata shape rejected loudly (strict schema).
+    assert.equal(
+      (await app.request("/me", authed("", { method: "PATCH", body: '{"metadata":{"prefs":{"timeFormat":"25h"}}}' })))
+        .status,
+      400
+    );
+  } finally {
+    close();
+  }
+});
+
+test("PATCH /me maps unique clashes to 409", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    await db.insert(users).values({ id: 2, email: "other@x.test", username: "other", timezone: "UTC" });
+    const app = appWith(db);
+    const emailClash = await app.request(
+      "/me?userId=2",
+      authed("", { method: "PATCH", body: JSON.stringify({ email: "host@x.test" }) })
+    );
+    assert.equal(emailClash.status, 409);
+    const usernameClash = await app.request(
+      "/me?userId=2",
+      authed("", { method: "PATCH", body: JSON.stringify({ username: "host" }) })
+    );
+    assert.equal(usernameClash.status, 409);
+    // Same-user no-op update is fine.
+    const self = await app.request("/me", authed("", { method: "PATCH", body: JSON.stringify({ username: "host" }) }));
+    assert.equal(self.status, 200);
+  } finally {
+    close();
+  }
+});
+
+test("PATCH /me/schedule updates schedule and keeps users.timezone in lockstep", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+    const res = await app.request(
+      "/me/schedule",
+      authed("", { method: "PATCH", body: JSON.stringify({ name: "Deep Work", timezone: "America/New_York" }) })
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.schedule, { id: 1, name: "Deep Work", timezone: "America/New_York" });
+    assert.equal(body.timezone, "America/New_York");
+    // Timezone-only patch leaves the name alone.
+    const tzOnly = await app.request(
+      "/me/schedule",
+      authed("", { method: "PATCH", body: JSON.stringify({ timezone: "Europe/Berlin" }) })
+    );
+    const tzBody = await tzOnly.json();
+    assert.equal(tzBody.schedule.name, "Deep Work");
+    assert.equal(tzBody.schedule.timezone, "Europe/Berlin");
+    // Missing schedule row is created (fresh user without one).
+    await db.insert(users).values({ id: 3, email: "c@x.test", username: "c", timezone: "UTC" });
+    const created = await app.request(
+      "/me/schedule?userId=3",
+      authed("", { method: "PATCH", body: JSON.stringify({ timezone: "UTC" }) })
+    );
+    assert.equal((await created.json()).schedule.name, "Working Hours");
+  } finally {
+    close();
+  }
+});

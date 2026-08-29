@@ -6,7 +6,7 @@
 //   - relays Stripe REST calls for the paid-booking flow (secret key never
 //     leaves this process)
 import { Hono, type Context } from "hono";
-import { and, asc, desc, eq, gt, inArray, lt } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, ne } from "drizzle-orm";
 import { createClient } from "@libsql/client";
 import { drizzle, type LibSQLDatabase } from "drizzle-orm/libsql";
 import { DateTime } from "luxon";
@@ -19,6 +19,8 @@ import {
 } from "./create-booking-handler";
 import { EventTypeNotFoundError, loadEventType } from "./event-types";
 import { computeMultiHostAvailability } from "./multi-host-routing";
+import { UserMetadata, parseUserMetadata, stringifyUserMetadata } from "./user-metadata";
+import { z } from "zod";
 
 export interface WorkerEnv {
   LIBSQL_URL?: string;
@@ -121,6 +123,208 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
           hostUserIds: hosts.filter((h) => h.eventTypeId === et.id).map((h) => h.hostUserId),
         }))
       );
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // User settings (/me) — profile, timezone, and the users.metadata contract
+  // (user-metadata.ts). Target user is the lowest-id user unless ?userId= is
+  // supplied (single-tenant deployments have exactly one).
+  // ---------------------------------------------------------------------------
+
+  const isValidTimezone = (tz: string) =>
+    tz.length > 0 && DateTime.now().setZone(tz).isValid;
+
+  const PatchMeInput = z
+    .object({
+      displayName: z.string().max(120).optional(),
+      avatarUrl: z.string().max(2048).optional(),
+      email: z.string().email().optional(),
+      username: z
+        .string()
+        .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,59}$/, "username may contain letters, digits, '.', '_', '-'")
+        .optional(),
+      timezone: z.string().optional(),
+      metadata: UserMetadata.optional(),
+    })
+    .strict();
+
+  const PatchScheduleInput = z
+    .object({ name: z.string().min(1).max(120).optional(), timezone: z.string().optional() })
+    .strict();
+
+  const loadTargetUser = async (
+    c: Context
+  ): Promise<
+    { error: Response; user?: undefined } | { error?: undefined; user: typeof schema.users.$inferSelect }
+  > => {
+    const userIdParam = c.req.query("userId");
+    const userId = userIdParam ? Number(userIdParam) : undefined;
+    if (userIdParam && (!Number.isInteger(userId) || (userId as number) <= 0)) {
+      return { error: await Response.json({ error: "userId must be a positive integer" }, { status: 400 }) };
+    }
+    const [user] = await db
+      .select()
+      .from(schema.users)
+      .where(userId ? eq(schema.users.id, userId) : undefined)
+      .orderBy(asc(schema.users.id))
+      .limit(1);
+    if (!user) return { error: await Response.json({ error: "no users exist" }, { status: 404 }) };
+    return { user };
+  };
+
+  const meResponse = async (user: typeof schema.users.$inferSelect) => {
+    const [schedule] = await db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.userId, user.id))
+      .limit(1);
+    return Response.json({
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      timezone: user.timezone,
+      displayName: user.displayName,
+      avatarUrl: user.avatarUrl,
+      // Loud parse: malformed metadata stored by an old writer surfaces as a
+      // 500 instead of silently rendering as empty settings.
+      metadata: parseUserMetadata(user.metadata),
+      schedule: schedule
+        ? { id: schedule.id, name: schedule.name, timezone: schedule.timezone }
+        : null,
+    });
+  };
+
+  app.get(
+    "/me",
+    guarded(async (c) => {
+      const target = await loadTargetUser(c);
+      if (target.error) return target.error;
+      return meResponse(target.user);
+    })
+  );
+
+  app.patch(
+    "/me",
+    guarded(async (c) => {
+      const target = await loadTargetUser(c);
+      if (target.error) return target.error;
+      let input: z.infer<typeof PatchMeInput>;
+      try {
+        input = PatchMeInput.parse(await c.req.json());
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          return Response.json(
+            { error: `invalid input: ${err.issues.map((i) => i.path.join(".")).join(", ")}` },
+            { status: 400 }
+          );
+        }
+        throw err;
+      }
+      const fields = Object.keys(input).filter((k) => (input as Record<string, unknown>)[k] !== undefined);
+      if (fields.length === 0) {
+        return Response.json({ error: "no fields to update" }, { status: 400 });
+      }
+      if (input.timezone !== undefined && !isValidTimezone(input.timezone)) {
+        return Response.json({ error: `unknown IANA timezone: ${input.timezone}` }, { status: 400 });
+      }
+      // Unique conflicts surfaced as 409 (pre-check + constraint backstop).
+      if (input.email !== undefined) {
+        const [clash] = await db
+          .select({ id: schema.users.id })
+          .from(schema.users)
+          .where(and(eq(schema.users.email, input.email), ne(schema.users.id, target.user.id)))
+          .limit(1);
+        if (clash) return Response.json({ error: "email already in use" }, { status: 409 });
+      }
+      if (input.username !== undefined) {
+        const [clash] = await db
+          .select({ id: schema.users.id })
+          .from(schema.users)
+          .where(and(eq(schema.users.username, input.username), ne(schema.users.id, target.user.id)))
+          .limit(1);
+        if (clash) return Response.json({ error: "username already in use" }, { status: 409 });
+      }
+      try {
+        await db
+          .update(schema.users)
+          .set({
+            ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
+            ...(input.avatarUrl !== undefined ? { avatarUrl: input.avatarUrl } : {}),
+            ...(input.email !== undefined ? { email: input.email } : {}),
+            ...(input.username !== undefined ? { username: input.username } : {}),
+            ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
+            ...(input.metadata !== undefined
+              ? { metadata: stringifyUserMetadata(input.metadata) }
+              : {}),
+          })
+          .where(eq(schema.users.id, target.user.id));
+      } catch (err) {
+        if (err instanceof Error && /UNIQUE/.test(err.message)) {
+          return Response.json({ error: "email or username already in use" }, { status: 409 });
+        }
+        throw err;
+      }
+      const [updated] = await db.select().from(schema.users).where(eq(schema.users.id, target.user.id)).limit(1);
+      return meResponse(updated);
+    })
+  );
+
+  app.patch(
+    "/me/schedule",
+    guarded(async (c) => {
+      const target = await loadTargetUser(c);
+      if (target.error) return target.error;
+      let input: z.infer<typeof PatchScheduleInput>;
+      try {
+        input = PatchScheduleInput.parse(await c.req.json());
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          return Response.json(
+            { error: `invalid input: ${err.issues.map((i) => i.path.join(".")).join(", ")}` },
+            { status: 400 }
+          );
+        }
+        throw err;
+      }
+      if (Object.keys(input).length === 0) {
+        return Response.json({ error: "no fields to update" }, { status: 400 });
+      }
+      if (input.timezone !== undefined && !isValidTimezone(input.timezone)) {
+        return Response.json({ error: `unknown IANA timezone: ${input.timezone}` }, { status: 400 });
+      }
+      // schedules.timezone is the availability source of truth; keep
+      // users.timezone (display default) in lockstep in one transaction.
+      await db.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(schema.schedules)
+          .where(eq(schema.schedules.userId, target.user.id))
+          .limit(1);
+        if (existing) {
+          await tx
+            .update(schema.schedules)
+            .set({
+              ...(input.name !== undefined ? { name: input.name } : {}),
+              ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
+            })
+            .where(eq(schema.schedules.id, existing.id));
+        } else {
+          await tx.insert(schema.schedules).values({
+            userId: target.user.id,
+            name: input.name ?? "Working Hours",
+            timezone: input.timezone ?? "UTC",
+          });
+        }
+        if (input.timezone !== undefined) {
+          await tx
+            .update(schema.users)
+            .set({ timezone: input.timezone })
+            .where(eq(schema.users.id, target.user.id));
+        }
+      });
+      const [updated] = await db.select().from(schema.users).where(eq(schema.users.id, target.user.id)).limit(1);
+      return meResponse(updated);
     })
   );
 
