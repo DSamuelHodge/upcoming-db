@@ -6,7 +6,16 @@
 //   - relays Stripe REST calls for the paid-booking flow (secret key never
 //     leaves this process)
 import { Hono, type Context } from "hono";
-import { and, asc, desc, eq, gt, inArray, lt, ne } from "drizzle-orm";
+
+// Hono context variables set by the auth middleware.
+export interface AppEnv {
+  Variables: {
+    authUserId?: number;
+    authIsAdmin?: boolean;
+  };
+}
+type AppContext = Context<AppEnv>;
+import { and, asc, desc, eq, gt, inArray, isNotNull, lt, ne, or } from "drizzle-orm";
 import { createClient } from "@libsql/client";
 import { drizzle, type LibSQLDatabase } from "drizzle-orm/libsql";
 import { DateTime } from "luxon";
@@ -21,6 +30,15 @@ import { EventTypeNotFoundError, loadEventType } from "./event-types";
 import { computeMultiHostAvailability } from "./multi-host-routing";
 import { UserMetadata, parseUserMetadata, stringifyUserMetadata } from "./user-metadata";
 import { encryptToken, decryptToken } from "./crypto";
+import {
+  hashPassword,
+  verifyPassword,
+  signAccessToken,
+  verifyAccessToken,
+  generateRefreshToken,
+  hashRefreshToken,
+  REFRESH_TOKEN_TTL_SECONDS,
+} from "./auth";
 import { z } from "zod";
 
 export interface WorkerEnv {
@@ -28,6 +46,7 @@ export interface WorkerEnv {
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
   API_SECRET?: string;
+  JWT_SECRET?: string;
   DAILY_API_KEY?: string;
   STRIPE_SECRET_KEY?: string;
 }
@@ -58,7 +77,7 @@ export interface AppDeps {
 }
 
 export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
-  const app = new Hono();
+  const app = new Hono<AppEnv>();
 
   const stripeKey = deps.stripeSecretKey ?? env.STRIPE_SECRET_KEY;
 
@@ -80,8 +99,8 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
 
   // Wraps a route body in the shared error contract.
   const guarded =
-    (fn: (c: Context) => Promise<Response>) =>
-    async (c: Context): Promise<Response> => {
+    (fn: (c: AppContext) => Promise<Response>) =>
+    async (c: AppContext): Promise<Response> => {
       try {
         return await fn(c);
       } catch (err) {
@@ -93,17 +112,196 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       }
     };
 
+  // Dual auth (2026-08-29):
+  //   /health + /auth/* are open.
+  //   A valid Bearer JWT authenticates as its `sub` user (authUserId).
+  //   Otherwise the legacy shared API_SECRET is required — it acts as the
+  //   admin/demo credential (authIsAdmin) and keeps invitee + demo flows
+  //   working unchanged. JWTs are attempted first; a malformed/expired one
+  //   falls through to the secret check (so a stale token with no secret
+  //   configured still 401s).
+  const OPEN_PATHS = new Set(["/health", "/auth/signup", "/auth/login", "/auth/refresh", "/auth/logout"]);
   app.use("*", async (c, next) => {
-    if (c.req.path === "/health") return next();
+    if (OPEN_PATHS.has(c.req.path)) return next();
     const auth = c.req.header("Authorization") ?? "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (env.JWT_SECRET && token && token.split(".").length === 3) {
+      try {
+        const payload = await verifyAccessToken(token, env.JWT_SECRET);
+        c.set("authUserId", Number(payload.sub));
+        return next();
+      } catch {
+        // fall through to the shared-secret path
+      }
+    }
     const expected = `Bearer ${env.API_SECRET ?? ""}`;
     if (!env.API_SECRET || auth !== expected) {
       return c.json({ error: "Unauthorized" }, 401);
     }
+    c.set("authIsAdmin", true);
     return next();
   });
 
   app.get("/health", (c) => c.json({ ok: true }));
+
+  // ---------------------------------------------------------------------------
+  // Auth (2026-08-29) — JWT sign-up/login/refresh/logout. Open routes: they
+  // mint the credentials everything else consumes. Requires env.JWT_SECRET.
+  // ---------------------------------------------------------------------------
+
+  const UsernameInput = z
+    .string()
+    .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,59}$/, "username may contain letters, digits, '.', '_', '-'");
+
+  const SignupInput = z
+    .object({
+      email: z.string().email(),
+      password: z.string().min(8).max(200),
+      username: UsernameInput,
+      displayName: z.string().max(120).optional(),
+      timezone: z.string().optional(),
+    })
+    .strict();
+
+  const LoginInput = z.object({ email: z.string().email(), password: z.string().min(1).max(200) }).strict();
+  const RefreshInput = z.object({ refreshToken: z.string().min(1).max(200) }).strict();
+
+  const nowIso = () => new Date().toISOString();
+  const isoAfter = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
+
+  const issueSession = async (userId: number): Promise<{ accessToken: string; refreshToken: string }> => {
+    const jwtSecret = env.JWT_SECRET;
+    if (!jwtSecret) throw new Error("JWT_SECRET is not configured");
+    const refreshToken = generateRefreshToken();
+    await db.insert(schema.sessions).values({
+      userId,
+      refreshTokenHash: hashRefreshToken(refreshToken),
+      expiresUtc: isoAfter(REFRESH_TOKEN_TTL_SECONDS),
+      createdUtc: nowIso(),
+    });
+    // Opportunistic cleanup of dead sessions (>7d past expiry or revoked).
+    const staleCutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    await db
+      .delete(schema.sessions)
+      .where(or(lt(schema.sessions.expiresUtc, staleCutoff), isNotNull(schema.sessions.revokedUtc)))
+      .catch(() => {});
+    return { accessToken: await signAccessToken(userId, jwtSecret), refreshToken };
+  };
+
+  const validSession = async (refreshToken: string) => {
+    const [row] = await db
+      .select()
+      .from(schema.sessions)
+      .where(eq(schema.sessions.refreshTokenHash, hashRefreshToken(refreshToken)))
+      .limit(1);
+    if (!row) return null;
+    if (row.revokedUtc) return null;
+    if (new Date(row.expiresUtc).getTime() <= Date.now()) return null;
+    return row;
+  };
+
+  app.post(
+    "/auth/signup",
+    guarded(async (c) => {
+      if (!env.JWT_SECRET) return c.json({ error: "auth not configured" }, 503);
+      let input: z.infer<typeof SignupInput>;
+      try {
+        input = SignupInput.parse(await c.req.json());
+      } catch (e) {
+        return c.json({ error: `invalid input: ${(e as z.ZodError).issues?.[0]?.path?.join(".") ?? "body"}` }, 400);
+      }
+      const clash = await db
+        .select({ id: schema.users.id, email: schema.users.email, username: schema.users.username })
+        .from(schema.users)
+        .where(or(eq(schema.users.email, input.email.toLowerCase()), eq(schema.users.username, input.username)));
+      if (clash.some((u) => u.email === input.email.toLowerCase())) {
+        return c.json({ error: "email already registered" }, 409);
+      }
+      if (clash.length > 0) {
+        return c.json({ error: "username already taken" }, 409);
+      }
+      const [user] = await db
+        .insert(schema.users)
+        .values({
+          email: input.email.toLowerCase(),
+          username: input.username,
+          displayName: input.displayName ?? "",
+          timezone: input.timezone && isValidTimezone(input.timezone) ? input.timezone : "UTC",
+          passwordHash: hashPassword(input.password),
+        })
+        .returning();
+      const tokens = await issueSession(user.id);
+      return c.json({ ...tokens, user: await mePayload(user) }, 201);
+    })
+  );
+
+  app.post(
+    "/auth/login",
+    guarded(async (c) => {
+      if (!env.JWT_SECRET) return c.json({ error: "auth not configured" }, 503);
+      let input: z.infer<typeof LoginInput>;
+      try {
+        input = LoginInput.parse(await c.req.json());
+      } catch {
+        return c.json({ error: "invalid input" }, 400);
+      }
+      const [user] = await db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.email, input.email.toLowerCase()))
+        .limit(1);
+      // Uniform 401: never reveal whether the email exists.
+      if (!user?.passwordHash || !verifyPassword(input.password, user.passwordHash)) {
+        return c.json({ error: "invalid email or password" }, 401);
+      }
+      const tokens = await issueSession(user.id);
+      return c.json({ ...tokens, user: await mePayload(user) });
+    })
+  );
+
+  app.post(
+    "/auth/refresh",
+    guarded(async (c) => {
+      if (!env.JWT_SECRET) return c.json({ error: "auth not configured" }, 503);
+      let input: z.infer<typeof RefreshInput>;
+      try {
+        input = RefreshInput.parse(await c.req.json());
+      } catch {
+        return c.json({ error: "invalid input" }, 400);
+      }
+      const session = await validSession(input.refreshToken);
+      if (!session) return c.json({ error: "invalid or expired refresh token" }, 401);
+      // Rotate: the presented token is consumed, a fresh pair is issued.
+      await db
+        .update(schema.sessions)
+        .set({ revokedUtc: nowIso() })
+        .where(eq(schema.sessions.id, session.id));
+      const [user] = await db.select().from(schema.users).where(eq(schema.users.id, session.userId)).limit(1);
+      if (!user) return c.json({ error: "user no longer exists" }, 401);
+      const tokens = await issueSession(user.id);
+      return c.json({ ...tokens, user: await mePayload(user) });
+    })
+  );
+
+  app.post(
+    "/auth/logout",
+    guarded(async (c) => {
+      let input: z.infer<typeof RefreshInput>;
+      try {
+        input = RefreshInput.parse(await c.req.json());
+      } catch {
+        return c.json({ error: "invalid input" }, 400);
+      }
+      const session = await validSession(input.refreshToken);
+      if (session) {
+        await db
+          .update(schema.sessions)
+          .set({ revokedUtc: nowIso() })
+          .where(eq(schema.sessions.id, session.id));
+      }
+      return c.json({ ok: true });
+    })
+  );
 
   // ---------------------------------------------------------------------------
   // Reads (sanctioned read-only SQL path)
@@ -154,15 +352,31 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     .object({ name: z.string().min(1).max(120).optional(), timezone: z.string().optional() })
     .strict();
 
+  // Target user resolution: a JWT-authenticated caller is always their own
+  // user (403 on a mismatched ?userId=). The shared-secret admin path keeps
+  // the legacy behavior — lowest-id user, or ?userId= override.
   const loadTargetUser = async (
-    c: Context
+    c: AppContext
   ): Promise<
     { error: Response; user?: undefined } | { error?: undefined; user: typeof schema.users.$inferSelect }
   > => {
+    const jwtUserId = c.get("authUserId") as number | undefined;
+    const isAdmin = c.get("authIsAdmin") === true;
     const userIdParam = c.req.query("userId");
     const userId = userIdParam ? Number(userIdParam) : undefined;
     if (userIdParam && (!Number.isInteger(userId) || (userId as number) <= 0)) {
       return { error: await Response.json({ error: "userId must be a positive integer" }, { status: 400 }) };
+    }
+    if (jwtUserId !== undefined) {
+      if (userId !== undefined && userId !== jwtUserId) {
+        return { error: await Response.json({ error: "forbidden: cannot access another user" }, { status: 403 }) };
+      }
+      const [self] = await db.select().from(schema.users).where(eq(schema.users.id, jwtUserId)).limit(1);
+      if (!self) return { error: await Response.json({ error: "user no longer exists" }, { status: 404 }) };
+      return { user: self };
+    }
+    if (userId && !isAdmin) {
+      return { error: await Response.json({ error: "forbidden: ?userId= requires admin credentials" }, { status: 403 }) };
     }
     const [user] = await db
       .select()
@@ -174,13 +388,13 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     return { user };
   };
 
-  const meResponse = async (user: typeof schema.users.$inferSelect) => {
+  const mePayload = async (user: typeof schema.users.$inferSelect) => {
     const [schedule] = await db
       .select()
       .from(schema.schedules)
       .where(eq(schema.schedules.userId, user.id))
       .limit(1);
-    return Response.json({
+    return {
       id: user.id,
       email: user.email,
       username: user.username,
@@ -193,8 +407,10 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       schedule: schedule
         ? { id: schedule.id, name: schedule.name, timezone: schedule.timezone }
         : null,
-    });
+    };
   };
+
+  const meResponse = async (user: typeof schema.users.$inferSelect) => Response.json(await mePayload(user));
 
   app.get(
     "/me",

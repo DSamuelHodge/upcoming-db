@@ -109,3 +109,15 @@ CREATE TABLE IF NOT EXISTS credentials (
   type TEXT NOT NULL,
   encrypted_token TEXT NOT NULL
 );
+
+-- Auth (additive, 2026-08-29): scrypt password hash + refresh sessions.
+ALTER TABLE users ADD COLUMN password_hash TEXT;
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  refresh_token_hash TEXT NOT NULL,
+  expires_utc TEXT NOT NULL,
+  created_utc TEXT NOT NULL,
+  revoked_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);

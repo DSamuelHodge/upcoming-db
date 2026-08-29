@@ -552,3 +552,187 @@ test("credentials: put/replace/list(masked)/delete round-trip", async () => {
     close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Auth (JWT sign-up/login/refresh/logout) — phase-7
+// ---------------------------------------------------------------------------
+
+const JWT_SECRET = "jwt-test-secret";
+
+function appWithAuth(db: TestDb) {
+  return createApp({ API_SECRET: SECRET, JWT_SECRET }, { db });
+}
+
+test("auth: signup mints tokens and a passwordless seed user cannot log in", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWithAuth(db);
+
+    const res = await app.request("/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "new@x.test",
+        password: "hunter2hunter2",
+        username: "newbie",
+        displayName: "New Bee",
+        timezone: "Europe/Berlin",
+      }),
+    });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.user.email, "new@x.test");
+    assert.equal(body.user.username, "newbie");
+    assert.equal(typeof body.accessToken, "string");
+    assert.ok(body.refreshToken.length >= 40);
+
+    // Duplicate email / username are 409; bad password is 400.
+    assert.equal(
+      (await app.request("/auth/signup", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "new@x.test", password: "hunter2hunter2", username: "other" }) })).status,
+      409
+    );
+    assert.equal(
+      (await app.request("/auth/signup", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "fresh@x.test", password: "hunter2hunter2", username: "newbie" }) })).status,
+      409
+    );
+    assert.equal(
+      (await app.request("/auth/signup", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "fresh@x.test", password: "short", username: "fresh" }) })).status,
+      400
+    );
+
+    // Passwordless (seeded) user cannot log in; unknown email gets the same
+    // uniform 401.
+    for (const creds of [
+      { email: "host@x.test", password: "anything123" },
+      { email: "ghost@x.test", password: "anything123" },
+    ]) {
+      const login = await app.request("/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(creds),
+      });
+      assert.equal(login.status, 401);
+      assert.equal((await login.json()).error, "invalid email or password");
+    }
+  } finally {
+    close();
+  }
+});
+
+test("auth: login + JWT-scoped /me replaces lowest-id resolution", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWithAuth(db);
+    const signup = await app.request("/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "me@x.test", password: "hunter2hunter2", username: "mee" }),
+    });
+    const { accessToken } = await signup.json();
+
+    // /me with the JWT returns the JWT subject, not the lowest-id user.
+    const me = await app.request("/me", { headers: { Authorization: `Bearer ${accessToken}` } });
+    assert.equal(me.status, 200);
+    assert.equal((await me.json()).username, "mee");
+
+    // ?userId= pointing elsewhere is forbidden with a JWT.
+    const hijack = await app.request("/me?userId=1", { headers: { Authorization: `Bearer ${accessToken}` } });
+    assert.equal(hijack.status, 403);
+
+    // Garbage token falls through to the secret path: without the secret → 401.
+    assert.equal((await app.request("/me", { headers: { Authorization: "Bearer not.a.jwt" } })).status, 401);
+    // …and with the shared secret → legacy admin behavior (lowest-id user).
+    const legacy = await app.request("/me", authed(""));
+    assert.equal((await legacy.json()).username, "host");
+
+    // Wrong password 401.
+    const bad = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "me@x.test", password: "wrong-wrong" }),
+    });
+    assert.equal(bad.status, 401);
+
+    // Right password 200.
+    const good = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "me@x.test", password: "hunter2hunter2" }),
+    });
+    assert.equal(good.status, 200);
+    assert.equal((await good.json()).user.username, "mee");
+  } finally {
+    close();
+  }
+});
+
+test("auth: refresh rotates sessions; logout revokes; reuse fails", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    const app = appWithAuth(db);
+    const signup = await app.request("/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "rot@x.test", password: "hunter2hunter2", username: "rot" }),
+    });
+    const first = await signup.json();
+
+    // Refresh with the original token works and issues a new pair.
+    const refresh1 = await app.request("/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: first.refreshToken }),
+    });
+    assert.equal(refresh1.status, 200);
+    const second = await refresh1.json();
+    assert.notEqual(second.refreshToken, first.refreshToken);
+
+    // The original token was consumed — reuse is rejected.
+    const reuse = await app.request("/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: first.refreshToken }),
+    });
+    assert.equal(reuse.status, 401);
+
+    // New refresh token → new pair works again.
+    const refresh2 = await app.request("/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: second.refreshToken }),
+    });
+    assert.equal(refresh2.status, 200);
+    const third = await refresh2.json();
+
+    // Logout revokes; the token stops working afterwards.
+    const logout = await app.request("/auth/logout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: third.refreshToken }),
+    });
+    assert.equal(logout.status, 200);
+    const afterLogout = await app.request("/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: third.refreshToken }),
+    });
+    assert.equal(afterLogout.status, 401);
+
+    // Bogus refresh tokens are 401.
+    assert.equal(
+      (await app.request("/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken: "nope" }),
+      })).status,
+      401
+    );
+  } finally {
+    close();
+  }
+});
