@@ -7,7 +7,7 @@ if (url.startsWith("file:") || url.startsWith("sqlite:")) {
 }
 
 export default defineConfig({
-  schema: "./schema.ts",
+  schema: "./src/schema.ts",
   out: "./drizzle",
   dialect: "turso",
   dbCredentials: {

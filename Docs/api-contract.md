@@ -1,7 +1,7 @@
 # API contract — upcoming-db
 
 Status: **handler contract** (there is no HTTP layer yet — the functions in
-`create-booking-handler.ts` / `multi-host-routing.ts` are the backend). This
+`src/create-booking-handler.ts` / `src/multi-host-routing.ts` are the backend). This
 document is the authoritative reference for the exact schema and the exact
 parameters each operation accepts and returns.
 
@@ -11,7 +11,7 @@ authenticates end users today; do not expose the DB token to clients.
 
 ---
 
-## 1. Database schema (exact, from `schema.ts` — Drizzle → SQLite)
+## 1. Database schema (exact, from `src/schema.ts` — Drizzle → SQLite)
 
 All timestamps are **ISO 8601 UTC strings** (e.g. `2027-06-01T10:00:00.000Z`).
 All times that drive availability math are UTC instants; wall-clock `HH:MM`
