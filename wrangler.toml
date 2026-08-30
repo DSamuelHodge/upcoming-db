@@ -9,4 +9,11 @@ compatibility_flags = ["nodejs_compat"]
 #   TURSO_AUTH_TOKEN   — DB-scoped token
 #   DAILY_API_KEY      — Daily.co room minting/teardown
 #   STRIPE_SECRET_KEY  — test-mode secret key for the paid-booking flow
+#   FCM_SERVICE_ACCOUNT — service-account key JSON for FCM HTTP v1 push
+#     (project_id, client_email, private_key). Unset = push disabled and the
+#     reminder cron no-ops. See fcm.ts.
 # No vars are committed here.
+
+# Reminder-push sweep every 15 minutes (no-ops without FCM_SERVICE_ACCOUNT).
+[triggers]
+crons = ["*/15 * * * *"]

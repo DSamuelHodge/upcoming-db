@@ -45,6 +45,10 @@ export const UserMetadata = z
       })
       .strict()
       .optional(),
+    // FCM push registration (2026-08-30). One token per user for v1 — the app
+    // overwrites it on token refresh. The server clears it when FCM reports
+    // the token unregistered/invalid (see fcm.ts).
+    fcmToken: z.string().min(1).max(512).optional(),
     // Profile context (populated by seed data, rendered by clients).
     role: z.string().max(120).optional(),
     company: z.string().max(120).optional(),
