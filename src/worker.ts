@@ -19,6 +19,8 @@ import { and, asc, desc, eq, gt, inArray, isNotNull, lt, ne, or } from "drizzle-
 import { createClient } from "@libsql/client";
 import { drizzle, type LibSQLDatabase } from "drizzle-orm/libsql";
 import { rateLimitMiddleware } from "./rate-limit";
+import { bookingEventPush, runReminderSweep } from "./fcm";
+import { logError } from "./logger";
 import { DateTime } from "luxon";
 import * as schema from "./schema";
 import {
@@ -50,6 +52,11 @@ export interface WorkerEnv {
   JWT_SECRET?: string;
   DAILY_API_KEY?: string;
   STRIPE_SECRET_KEY?: string;
+  // FCM push (fcm.ts). Unset = push disabled; reminder cron no-ops.
+  FCM_SERVICE_ACCOUNT?: string;
+  FCM_API_BASE_URL?: string;
+  GOOGLE_TOKEN_URL?: string;
+  FCM_TIMEOUT_MS?: string;
 }
 
 type AppDb = LibSQLDatabase<typeof schema>;
@@ -72,6 +79,19 @@ export function resolveDbUrl(env: WorkerEnv, allowSqliteFileUrls = false): strin
 // and @libsql/client manages its own connection pooling.
 const dbCache = new Map<string, AppDb>();
 
+export function getDb(env: WorkerEnv): AppDb {
+  const url = resolveDbUrl(env);
+  let cached = dbCache.get(url);
+  if (!cached) {
+    const client = createClient(
+      env.TURSO_AUTH_TOKEN ? { url, authToken: env.TURSO_AUTH_TOKEN } : { url }
+    );
+    cached = drizzle(client, { schema });
+    dbCache.set(url, cached);
+  }
+  return cached;
+}
+
 export interface AppDeps {
   db?: AppDb;
   stripeSecretKey?: string;
@@ -86,16 +106,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
   if (deps.db) {
     db = deps.db;
   } else {
-    const url = resolveDbUrl(env);
-    let cached = dbCache.get(url);
-    if (!cached) {
-      const client = createClient(
-        env.TURSO_AUTH_TOKEN ? { url, authToken: env.TURSO_AUTH_TOKEN } : { url }
-      );
-      cached = drizzle(client, { schema });
-      dbCache.set(url, cached);
-    }
-    db = cached;
+    db = getDb(env);
   }
 
   // Wraps a route body in the shared error contract.
@@ -112,6 +123,17 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
         return c.json({ error: mapping.message }, mapping.status as 400);
       }
     };
+
+  // Post-response background work. Uses the runtime's waitUntil when available
+  // (real Workers requests); falls back to a plain fire-and-forget promise in
+  // test runners, where `c.executionCtx` is absent and would throw.
+  const waitUntil = (c: AppContext, promise: Promise<unknown>): void => {
+    try {
+      c.executionCtx.waitUntil(promise);
+    } catch {
+      promise.catch(() => {});
+    }
+  };
 
   // Dual auth (2026-08-29):
   //   /health + /auth/* are open.
@@ -960,6 +982,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       const result = await createBookingHandler(db, await c.req.json());
       // Normalize to the documented contract: first-time creates report
       // replay: false explicitly.
+      waitUntil(c, bookingEventPush(db, env, result.uid, "booking.created").catch(() => {}));
       return Response.json({ ...result, replay: result.replay ?? false }, { status: 200 });
     })
   );
@@ -968,6 +991,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     "/bookings/cancel",
     guarded(async (c) => {
       const result = await cancelBookingHandler(db, await c.req.json());
+      waitUntil(c, bookingEventPush(db, env, result.uid, "booking.cancelled").catch(() => {}));
       return Response.json(result);
     })
   );
@@ -1200,7 +1224,23 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       if (updated.length === 0) {
         return Response.json({ error: "accepted booking not found for uid" }, { status: 404 });
       }
+      waitUntil(c, bookingEventPush(db, env, body.uid, "booking.paid").catch(() => {}));
       return Response.json({ uid: body.uid, paid: true, paymentIntentId: body.paymentIntentId });
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // Push (2026-08-30) — manual reminder-sweep trigger for staging/tests.
+  // The cron (wrangler.toml crons) runs the same sweep; both no-op without
+  // FCM_SERVICE_ACCOUNT. Admin-only: the sweep fans out per-user reads.
+  // ---------------------------------------------------------------------------
+  app.post(
+    "/push-reminders",
+    guarded(async (c) => {
+      if (c.get("authIsAdmin") !== true) {
+        return c.json({ error: "admin only" }, 403);
+      }
+      return c.json(await runReminderSweep(db, env));
     })
   );
 
@@ -1217,6 +1257,20 @@ const worker = {
     g.process.env ??= {};
     if (env.DAILY_API_KEY) g.process.env.DAILY_API_KEY = env.DAILY_API_KEY;
     return createApp(env).fetch(req, env);
+  },
+
+  // Cron trigger (wrangler.toml: crons = ["*/15 * * * *"]) — reminder-push
+  // sweep. Window math in fcm.ts makes each reminder fire in exactly one tick.
+  async scheduled(
+    _event: { cron: string },
+    env: WorkerEnv,
+    ctx: { waitUntil: (promise: Promise<unknown>) => void }
+  ): Promise<void> {
+    ctx.waitUntil(
+      runReminderSweep(getDb(env), env).catch((err) => {
+        logError("fcm_reminder_sweep_failed", { message: String(err).slice(0, 200) });
+      })
+    );
   },
 };
 
