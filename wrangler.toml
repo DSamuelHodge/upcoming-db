@@ -1,0 +1,12 @@
+name = "upcoming-db-api"
+main = "worker.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets (set with `wrangler secret put <NAME>` or the dashboard/API):
+#   API_SECRET        — bearer token clients must present
+#   TURSO_DATABASE_URL — libsql://… instance URL (or LIBSQL_URL)
+#   TURSO_AUTH_TOKEN   — DB-scoped token
+#   DAILY_API_KEY      — Daily.co room minting/teardown
+#   STRIPE_SECRET_KEY  — test-mode secret key for the paid-booking flow
+# No vars are committed here.

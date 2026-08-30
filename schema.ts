@@ -14,7 +14,28 @@ export const users = sqliteTable("users", {
   // the scheduling engine never reads them.
   displayName: text("display_name").notNull().default(""),
   avatarUrl: text("avatar_url").notNull().default(""),
+  // scrypt password hash (auth, 2026-08-29). Null = passwordless account
+  // (seeded/demo users managed via the shared API secret) — they can't log in.
+  passwordHash: text("password_hash"),
 });
+
+// Refresh-token sessions (auth, 2026-08-29). One row per issued refresh
+// token; logout/rotation marks revoked_utc. The raw token is never stored —
+// only its SHA-256.
+export const sessions = sqliteTable(
+  "sessions",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id),
+    refreshTokenHash: text("refresh_token_hash").notNull(),
+    expiresUtc: text("expires_utc").notNull(),
+    createdUtc: text("created_utc").notNull(),
+    revokedUtc: text("revoked_utc"),
+  },
+  (t) => ({ sessionIdx: index("sessions_user_idx").on(t.userId) })
+);
 
 export const schedules = sqliteTable(
   "schedules",
@@ -204,3 +225,29 @@ export const credentials = sqliteTable("credentials", {
   type: text("type").notNull(), // 'google_calendar' | 'office365_calendar' | ...
   encryptedToken: text("encrypted_token").notNull(),
 });
+
+// Single-use booking links (additive, 2026-08-30): each row is one Calendly-
+// style one-time booking link for an event type. Burned exactly once by
+// createBookingHandler when a booking lands carrying its token.
+export const singleUseLinks = sqliteTable(
+  "single_use_links",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    // Public, unguessable token embedded in the share URL (?lid=...).
+    token: text("token").notNull().unique(),
+    eventTypeId: integer("event_type_id")
+      .notNull()
+      .references(() => eventTypes.id),
+    createdByUserId: integer("created_by_user_id")
+      .notNull()
+      .references(() => users.id),
+    createdUtc: text("created_utc").notNull(),
+    expiresUtc: text("expires_utc"), // optional deadline; null = never expires
+    usedBookingId: integer("used_booking_id").references(() => bookings.id),
+    usedUtc: text("used_utc"),
+    revokedUtc: text("revoked_utc"),
+  },
+  (t) => ({
+    eventTypeIdx: index("single_use_links_event_type_idx").on(t.eventTypeId),
+  })
+);

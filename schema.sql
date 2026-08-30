@@ -109,3 +109,29 @@ CREATE TABLE IF NOT EXISTS credentials (
   type TEXT NOT NULL,
   encrypted_token TEXT NOT NULL
 );
+
+-- Auth (additive, 2026-08-29): scrypt password hash + refresh sessions.
+ALTER TABLE users ADD COLUMN password_hash TEXT;
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  refresh_token_hash TEXT NOT NULL,
+  expires_utc TEXT NOT NULL,
+  created_utc TEXT NOT NULL,
+  revoked_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
+-- Single-use booking links (additive, 2026-08-30).
+CREATE TABLE IF NOT EXISTS single_use_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT NOT NULL UNIQUE,
+  event_type_id INTEGER NOT NULL REFERENCES event_types(id),
+  created_by_user_id INTEGER NOT NULL REFERENCES users(id),
+  created_utc TEXT NOT NULL,
+  expires_utc TEXT,
+  used_booking_id INTEGER REFERENCES bookings(id),
+  used_utc TEXT,
+  revoked_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS single_use_links_event_type_idx ON single_use_links(event_type_id);
