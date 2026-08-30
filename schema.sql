@@ -121,3 +121,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked_utc TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
+-- Single-use booking links (additive, 2026-08-30).
+CREATE TABLE IF NOT EXISTS single_use_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT NOT NULL UNIQUE,
+  event_type_id INTEGER NOT NULL REFERENCES event_types(id),
+  created_by_user_id INTEGER NOT NULL REFERENCES users(id),
+  created_utc TEXT NOT NULL,
+  expires_utc TEXT,
+  used_booking_id INTEGER REFERENCES bookings(id),
+  used_utc TEXT,
+  revoked_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS single_use_links_event_type_idx ON single_use_links(event_type_id);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { eq } from "drizzle-orm";
 import { createApp } from "./worker";
-import { attendees, availability, eventTypeHosts, eventTypes, schedules, users } from "./schema";
+import { attendees, availability, eventTypeHosts, eventTypes, schedules, singleUseLinks, users } from "./schema";
 import { openTestDb, type TestDb } from "./test-db";
 
 const SECRET = "test-secret";
@@ -732,6 +732,159 @@ test("auth: refresh rotates sessions; logout revokes; reuse fails", async () => 
       })).status,
       401
     );
+  } finally {
+    close();
+  }
+});
+
+// Single-use booking links (2026-08-30) — create/list/revoke + burn-on-booking
+test("single-use links: create, list, revoke (admin path)", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+
+    const created = await app.request(
+      "/single-use-links",
+      authed("", { method: "POST", body: JSON.stringify({ eventTypeId: 1, count: 2 }) })
+    );
+    assert.equal(created.status, 201);
+    const links = (await created.json()) as Array<Record<string, unknown>>;
+    assert.equal(links.length, 2);
+    assert.notEqual(links[0].token, links[1].token);
+    assert.equal(
+      links[0].url,
+      `https://getupcoming.app/host/intro?lid=${links[0].token}`
+    );
+    assert.equal(links[0].status, "unused");
+
+    const listed = await app.request("/single-use-links?eventTypeId=1", authed(""));
+    assert.equal(listed.status, 200);
+    assert.equal(((await listed.json()) as unknown[]).length, 2);
+
+    const revoked = await app.request(`/single-use-links/${links[0].id}`, authed("", { method: "DELETE" }));
+    assert.equal(revoked.status, 200);
+    const afterList = await app.request("/single-use-links?eventTypeId=1", authed(""));
+    const rows = (await afterList.json()) as Array<{ id: number; status: string }>;
+    assert.equal(rows.find((r) => r.id === links[0].id)?.status, "revoked");
+    assert.equal(rows.find((r) => r.id === links[1].id)?.status, "unused");
+
+    // Revoking twice stays idempotent.
+    const again = await app.request(`/single-use-links/${links[0].id}`, authed("", { method: "DELETE" }));
+    assert.equal(again.status, 200);
+
+    // Validation: missing/unknown eventTypeId.
+    assert.equal((await app.request("/single-use-links", authed(""))).status, 400);
+    const unknown = await app.request(
+      "/single-use-links",
+      authed("", { method: "POST", body: JSON.stringify({ eventTypeId: 999 }) })
+    );
+    assert.equal(unknown.status, 404);
+  } finally {
+    close();
+  }
+});
+
+test("single-use links: JWT user can manage own links, not another owner's", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWithAuth(db);
+    const signup = await app.request("/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "link@x.test", password: "hunter2hunter2", username: "linker" }),
+    });
+    const { accessToken } = (await signup.json()) as { accessToken: string };
+    const jwt = { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } };
+
+    // Someone else's event type → 403.
+    const foreign = await app.request(
+      "/single-use-links",
+      { ...jwt, method: "POST", body: JSON.stringify({ eventTypeId: 1 }) }
+    );
+    assert.equal(foreign.status, 403);
+
+    // Own event type → 201, URL carries their username.
+    await db.insert(eventTypes).values({
+      id: 2,
+      ownerUserId: 2,
+      slug: "own-call",
+      lengthMinutes: 30,
+      schedulingType: "individual",
+      locations: LOCATIONS_JSON,
+      minBookingNotice: 0,
+      title: "Own Call",
+      isActive: true,
+    });
+    await db.insert(eventTypeHosts).values({ eventTypeId: 2, hostUserId: 2, priority: 0 });
+    const own = await app.request(
+      "/single-use-links",
+      { ...jwt, method: "POST", body: JSON.stringify({ eventTypeId: 2 }) }
+    );
+    assert.equal(own.status, 201);
+    const [link] = (await own.json()) as Array<{ url: string; status: string }>;
+    assert.equal(link.url.startsWith("https://getupcoming.app/linker/own-call?lid="), true);
+  } finally {
+    close();
+  }
+});
+
+test("single-use links: burned on booking, reuse rejected, expired rejected", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+    const create = await app.request(
+      "/single-use-links",
+      authed("", { method: "POST", body: JSON.stringify({ eventTypeId: 1 }) })
+    );
+    const [link] = (await create.json()) as Array<{ token: string }>;
+
+    const bookingInput = (key: string, start = "14:00", end = "14:30") => ({
+      eventTypeId: 1,
+      slotStartUtc: `2027-06-01T${start}:00Z`,
+      slotEndUtc: `2027-06-01T${end}:00Z`,
+      location: { type: "inPerson" },
+      attendee: { email: "guest@example.com", name: "Guest" },
+      idempotencyKey: key,
+      singleUseToken: link.token,
+    });
+
+    const created = await app.request("/bookings", authed("", { method: "POST", body: JSON.stringify(bookingInput("su-1")) }));
+    assert.equal(created.status, 200);
+
+    const listed = await app.request("/single-use-links?eventTypeId=1", authed(""));
+    const rows = (await listed.json()) as Array<{ token: string; status: string; usedAt: string | null }>;
+    assert.equal(rows.find((r) => r.token === link.token)?.status, "used");
+    assert.notEqual(rows.find((r) => r.token === link.token)?.usedAt, null);
+
+    // Reuse is rejected with a 409 and the link stays burned.
+    const reuse = await app.request("/bookings", authed("", { method: "POST", body: JSON.stringify(bookingInput("su-2", "15:00", "15:30")) }));
+    assert.equal(reuse.status, 409);
+    assert.equal(((await reuse.json()) as { error: string }).error, "single-use link has already been used");
+
+    // Unknown token → 409.
+    const unknownToken = await app.request(
+      "/bookings",
+      authed("", { method: "POST", body: JSON.stringify({ ...bookingInput("su-3", "15:30", "16:00"), singleUseToken: "no-such-token-0000" }) })
+    );
+    assert.equal(unknownToken.status, 409);
+
+    // An expired link cannot book.
+    await db.insert(singleUseLinks).values({
+      token: "expired-token-123456",
+      eventTypeId: 1,
+      createdByUserId: 1,
+      createdUtc: "2026-01-01T00:00:00.000Z",
+      expiresUtc: "2026-01-02T00:00:00.000Z",
+    });
+    const expired = await app.request(
+      "/bookings",
+      authed("", { method: "POST", body: JSON.stringify({ ...bookingInput("su-4", "16:00", "16:30"), singleUseToken: "expired-token-123456" }) })
+    );
+    assert.equal(expired.status, 409);
+    assert.equal(((await expired.json()) as { error: string }).error, "single-use link has expired");
   } finally {
     close();
   }

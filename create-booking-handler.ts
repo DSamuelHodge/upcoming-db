@@ -17,7 +17,7 @@ import { InvalidJsonColumnError, parseLocationsColumn } from "./json-columns";
 import { logWarn } from "./logger";
 import { assignRoundRobinHost, HostLoadRepository } from "./multi-host-routing";
 import * as schema from "./schema";
-import { attendees, availability, bookingHosts, bookings, hostOccupancyTicks, schedules } from "./schema";
+import { attendees, availability, bookingHosts, bookings, hostOccupancyTicks, schedules, singleUseLinks } from "./schema";
 
 export { EventTypeNotFoundError };
 
@@ -38,6 +38,10 @@ export const CreateBookingInput = z.object({
     phone: z.string().optional(),
   }),
   idempotencyKey: z.string().min(1),
+  // Optional Calendly-style single-use link token (?lid=...). When present it
+  // must reference an unused, unrevoked, unexpired link for this event type;
+  // the link is burned atomically inside the booking transaction.
+  singleUseToken: z.string().min(8).max(128).optional(),
 });
 export type CreateBookingInput = z.infer<typeof CreateBookingInput>;
 
@@ -55,6 +59,12 @@ export interface BookingResult {
 }
 
 export class SlotConflictError extends Error {
+  readonly statusCode = 409 as const;
+}
+
+/** A booking arrived carrying a single-use link token that cannot be used:
+ *  unknown token, wrong event type, already used, revoked, or expired. */
+export class SingleUseLinkError extends Error {
   readonly statusCode = 409 as const;
 }
 
@@ -85,6 +95,7 @@ export type HttpErrorMapping = { status: number; message: string };
  */
 export function mapErrorToHttp(err: unknown): HttpErrorMapping {
   if (err instanceof SlotConflictError) return { status: err.statusCode, message: err.message };
+  if (err instanceof SingleUseLinkError) return { status: err.statusCode, message: err.message };
   if (err instanceof BookingNotFoundError) return { status: err.statusCode, message: err.message };
   if (err instanceof LocationNotOfferedError) return { status: err.statusCode, message: err.message };
   if (err instanceof z.ZodError) {
@@ -666,6 +677,27 @@ async function commitBooking(
         attendingHostUserIds = [hostUserId];
       }
 
+      // Single-use link validation + burn, inside the same transaction as the
+      // booking insert: a failed/conflicting booking never burns a link, and a
+      // burned link always corresponds to a persisted booking.
+      let singleUseLinkId: number | null = null;
+      if (input.singleUseToken !== undefined) {
+        const [link] = await tx
+          .select()
+          .from(singleUseLinks)
+          .where(eq(singleUseLinks.token, input.singleUseToken))
+          .limit(1);
+        if (!link || link.eventTypeId !== input.eventTypeId) {
+          throw new SingleUseLinkError("single-use link is not valid for this event type");
+        }
+        if (link.revokedUtc) throw new SingleUseLinkError("single-use link has been revoked");
+        if (link.usedUtc) throw new SingleUseLinkError("single-use link has already been used");
+        if (link.expiresUtc && new Date(link.expiresUtc).getTime() <= Date.now()) {
+          throw new SingleUseLinkError("single-use link has expired");
+        }
+        singleUseLinkId = link.id;
+      }
+
       const [inserted] = await tx
         .insert(bookings)
         .values({
@@ -685,6 +717,13 @@ async function commitBooking(
 
       if (!inserted) {
         throw new Error("Booking insert returned no row");
+      }
+
+      if (singleUseLinkId !== null) {
+        await tx
+          .update(singleUseLinks)
+          .set({ usedBookingId: inserted.id, usedUtc: DateTime.now().toUTC().toISO()! })
+          .where(eq(singleUseLinks.id, singleUseLinkId));
       }
 
       const secondaryHostIds = attendingHostUserIds.filter((id) => id !== hostUserId);
