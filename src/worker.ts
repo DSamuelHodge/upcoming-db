@@ -886,12 +886,74 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     })
   );
 
+  // ---------------------------------------------------------------------------
+  // Booking reads (2026-08-30) — cross-tenant read exposure fix. Realizes the
+  // documented "JWT: own; admin: all" contract. A JWT caller is scoped even if
+  // they also carry admin (same established guard as loadOwnedEventType); the
+  // legacy admin secret (no JWT) surface stays unscoped for ops. Internal
+  // server-side readers (reminder sweep, push fan-out) hit the db directly and
+  // never go through these routes.
+  // ---------------------------------------------------------------------------
+
+  // Own-predicate for a JWT caller: they are the primary host
+  // (bookings.hostUserId), a co-host (bookingHosts), or the attendee whose
+  // email matches their own user email (attendees are identified by email in
+  // the schema — no userId column).
+  const isBookingCoHost = async (bookingId: number, hostUserId: number): Promise<boolean> => {
+    const [sec] = await db
+      .select({ id: schema.bookingHosts.id })
+      .from(schema.bookingHosts)
+      .where(and(eq(schema.bookingHosts.bookingId, bookingId), eq(schema.bookingHosts.hostUserId, hostUserId)))
+      .limit(1);
+    return !!sec;
+  };
+
+  const isAttendeeOfBooking = async (bookingId: number, attendeeEmail: string): Promise<boolean> => {
+    const [att] = await db
+      .select({ id: schema.attendees.id })
+      .from(schema.attendees)
+      .where(and(eq(schema.attendees.bookingId, bookingId), eq(schema.attendees.email, attendeeEmail)))
+      .limit(1);
+    return !!att;
+  };
+
+  // The attendee-email path needs the caller's users row (same as
+  // loadTargetUser): a JWT whose user no longer exists is 404.
+  const loadScopedBookingCaller = async (
+    c: AppContext
+  ): Promise<
+    { error: Response; user?: undefined } | { error?: undefined; user: typeof schema.users.$inferSelect }
+  > => {
+    const jwtUserId = c.get("authUserId") as number | undefined;
+    // Unreachable through the auth middleware (no JWT and no secret is 401);
+    // kept total so the SQL never sees a undefined id.
+    if (jwtUserId === undefined) {
+      return { error: await Response.json({ error: "booking not found" }, { status: 404 }) };
+    }
+    const [self] = await db.select().from(schema.users).where(eq(schema.users.id, jwtUserId)).limit(1);
+    if (!self) return { error: await Response.json({ error: "user no longer exists" }, { status: 404 }) };
+    return { user: self };
+  };
+
   app.get(
     "/bookings/:uid",
     guarded(async (c) => {
       const uid = c.req.param("uid") ?? "";
       const [booking] = await db.select().from(schema.bookings).where(eq(schema.bookings.uid, uid)).limit(1);
       if (!booking) return Response.json({ error: "booking not found" }, { status: 404 });
+      // Read scoping: 404 (not 403) when not visible — do not leak existence
+      // of other users' booking uids.
+      const jwtUserId = c.get("authUserId") as number | undefined;
+      if (c.get("authIsAdmin") !== true || jwtUserId !== undefined) {
+        const scoped = await loadScopedBookingCaller(c);
+        if (scoped.error) return scoped.error;
+        const self = scoped.user;
+        const visible =
+          booking.hostUserId === self.id ||
+          (await isBookingCoHost(booking.id, self.id)) ||
+          (await isAttendeeOfBooking(booking.id, self.email));
+        if (!visible) return Response.json({ error: "booking not found" }, { status: 404 });
+      }
       const [attendee] = await db
         .select()
         .from(schema.attendees)
@@ -924,11 +986,49 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       const from = c.req.query("from");
       const to = c.req.query("to");
       const activeOnly = c.req.query("activeOnly") === "true";
+      // Scoping: JWT callers AND a three-way own-predicate (primary host,
+      // co-host, or attendee-by-own-email); narrowers apply on top. A
+      // hostUserId param naming another user is forbidden; naming the caller
+      // it just narrows their own set. The legacy admin secret (no JWT) keeps
+      // the unscoped ops surface.
+      let scope: ReturnType<typeof or> | undefined;
+      const jwtUserId = c.get("authUserId") as number | undefined;
+      if (c.get("authIsAdmin") !== true || jwtUserId !== undefined) {
+        if (hostUserId) {
+          const parsed = Number(hostUserId);
+          if (!Number.isInteger(parsed) || parsed <= 0) {
+            return Response.json({ error: "hostUserId must be a positive integer" }, { status: 400 });
+          }
+          if (parsed !== jwtUserId) {
+            return Response.json({ error: "forbidden: cannot access another user" }, { status: 403 });
+          }
+        }
+        const scoped = await loadScopedBookingCaller(c);
+        if (scoped.error) return scoped.error;
+        scope = or(
+          eq(schema.bookings.hostUserId, scoped.user.id),
+          inArray(
+            schema.bookings.id,
+            db
+              .select({ bookingId: schema.bookingHosts.bookingId })
+              .from(schema.bookingHosts)
+              .where(eq(schema.bookingHosts.hostUserId, scoped.user.id))
+          ),
+          inArray(
+            schema.bookings.id,
+            db
+              .select({ bookingId: schema.attendees.bookingId })
+              .from(schema.attendees)
+              .where(eq(schema.attendees.email, scoped.user.email))
+          )
+        );
+      }
       const conditions = [
         hostUserId ? eq(schema.bookings.hostUserId, Number(hostUserId)) : undefined,
         from ? gt(schema.bookings.endTime, from) : undefined,
         to ? lt(schema.bookings.startTime, to) : undefined,
         activeOnly ? inArray(schema.bookings.status, ["pending", "accepted"]) : undefined,
+        scope,
       ].filter((x): x is Exclude<typeof x, undefined> => x !== undefined);
       const rows = await db
         .select()
