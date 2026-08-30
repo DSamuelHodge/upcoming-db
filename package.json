@@ -3,11 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsx --test \"*.test.ts\"",
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "schema:apply": "tsx apply-schema.ts",
-    "schema:additive-2026-08-28": "tsx apply-additive-2026-08-28.ts",
-    "drift:check": "tsx check-schema-drift.ts",
+    "schema:apply": "tsx scripts/apply-schema.ts",
+    "schema:additive-2026-08-28": "tsx scripts/apply-additive-2026-08-28.ts",
+    "drift:check": "tsx scripts/check-schema-drift.ts",
     "libsql:start": "mkdir -p .libsql-instance && sqld --db-path .libsql-instance --http-listen-addr 127.0.0.1:8080"
   },
   "dependencies": {

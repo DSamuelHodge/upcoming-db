@@ -1,5 +1,5 @@
 import { createClient } from "@libsql/client";
-import { readSchemaSql, statementsFromSql } from "./schema-sql";
+import { readSchemaSql, statementsFromSql } from "../src/schema-sql";
 
 function requireLibsqlUrl(): string {
   const url = process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL;

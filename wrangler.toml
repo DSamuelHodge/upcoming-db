@@ -1,5 +1,5 @@
 name = "upcoming-db-api"
-main = "worker.ts"
+main = "src/worker.ts"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["nodejs_compat"]
 

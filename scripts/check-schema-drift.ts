@@ -1,7 +1,7 @@
 import { createClient } from "@libsql/client";
 import { Table, getTableName } from "drizzle-orm";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
-import * as schema from "./schema";
+import * as schema from "../src/schema";
 
 // Compares a live LibSQL/Turso instance against the canonical Drizzle schema
 // (schema.ts). Asserts every table and named index in schema.ts exists on the
