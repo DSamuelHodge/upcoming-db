@@ -251,3 +251,23 @@ export const singleUseLinks = sqliteTable(
     eventTypeIdx: index("single_use_links_event_type_idx").on(t.eventTypeId),
   })
 );
+
+// Reschedule idempotency (additive, 2026-08-30): deduplicates POST
+// /bookings/:uid/reschedule retries. One row per distinct idempotency key;
+// replay returns the booking's current state without re-applying the move.
+export const rescheduleIdempotency = sqliteTable(
+  "reschedule_idempotency",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    idempotencyKey: text("idempotency_key").notNull().unique(),
+    bookingId: integer("booking_id")
+      .notNull()
+      .references(() => bookings.id),
+    newStartTime: text("new_start_time").notNull(),
+    newEndTime: text("new_end_time").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => ({
+    bookingIdx: index("reschedule_idempotency_booking_idx").on(t.bookingId),
+  })
+);

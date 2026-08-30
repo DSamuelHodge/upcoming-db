@@ -245,6 +245,42 @@ DST note: ranges are walked day-by-day in each schedule's local timezone;
 spring-forward/fall-back are handled (missing wall-clock times produce no
 slots, duplicated times resolve to first occurrence).
 
+### 2.4 Reschedule booking — `rescheduleBookingHandler(db, uid, rawInput)`
+
+Moves an existing accepted booking to a new slot **in place** (same `uid`, same
+`eventTypeId` — the event type never changes). The request reuses the creation
+flow's validation against the new slot; the old slot is freed atomically.
+
+**Input** (Zod-validated; `uid` is the URL param, body carries the new slot):
+
+```jsonc
+{
+  "slotStartUtc": "2027-06-01T14:00:00Z", // ISO 8601 WITH offset info, required
+  "slotEndUtc":   "2027-06-01T14:30:00Z", // ISO 8601 WITH offset info, required
+  "idempotencyKey": "your-reschedule-key",  // required, UNIQUE per reschedule attempt
+  "reason": "host proposed new time"        // optional, max 2000 chars, not persisted as a booking column in v1
+}
+```
+
+Rules enforced at commit time (same as create, against the **new** slot):
+- `eventTypeId` is immutable — reschedule stays on the original event type.
+- `slotEnd − slotStart` must equal `eventTypes.length_minutes`.
+- Slot must lie inside working hours for **every** attending host, respect `min_booking_notice`, and land **exactly on the slot grid** (window start + k × slot_interval) — checked by re-running the availability engine's DST-safe day-walk for each host over a ±48 h window, with the booking's own current interval excluded so its old footprint does not block the move.
+- No other active booking's snapshotted buffered interval ` [start − bufferBefore, end + bufferAfter]` may overlap the new slot — checked in SQL via `bufferedOverlapExists` excluding the rescheduled booking's own row.
+- Concurrency backstop is the same `host_occupancy_ticks` unique index: old ticks are pruned and new ticks are inserted in the same transaction as the `bookings` row update; a losing tick insert surfaces as `SlotConflictError` → **409**, exactly like a fresh booking. `SQLITE_BUSY` retries (16, backoff) are handled inside the handler.
+- Buffers are **re-snapshotted** from the live `event_types` row onto `bookings.buffer_before/after` at reschedule time, so a later-changed event-type buffer setting applies to the new footprint.
+- Cancelled/rejected bookings cannot be rescheduled → `SlotConflictError` → **409**.
+- Unknown `uid` → `BookingNotFoundError` → **404**.
+- Auth scoping (HTTP layer): admin (`API_SECRET`) may reschedule any booking; a JWT caller may reschedule only bookings where they are the `host_user_id`, a secondary `booking_hosts` host (collective), or the `event_types.owner_user_id` — otherwise **403**. Idempotency keys are global (`reschedule_idempotency.idempotency_key` UNIQUE); a replay with the same key returns the mapped booking with `replay: true` even if the `uid` param differs.
+
+**Output:** same `BookingResult` shape as create/cancel, with updated `startUtc`/`endUtc` (and re-snapshotted `buffer_*` reflected in the occupancy footprint). `replay: true` on idempotent replay, `replay: false` otherwise. The `uid` never changes, so a Room read-cache client can update its row by `uid`.
+
+**Idempotency:** `reschedule_idempotency` stores one row per `idempotencyKey` (`booking_id`, `new_start_time`, `new_end_time`, `created_at`). A second POST with the same `uid` + same key returns the current booking with `replay: true`; the write transaction is not re-applied. A no-op reschedule where the booking is already at the target slot still records the key and returns `replay: false` on first call, `replay: true` on retry.
+
+**Location / Daily rooms:** v1 does not mint a new Daily room on reschedule; `bookings.location` is unchanged (the original chosen location/URL stays). A follow-up may re-mint when the location is `integrations:daily` and the slot moves (requires `nbf`/`exp` rewrite + teardown of the old minted room).
+
+**Push:** a successful reschedule fires `booking.rescheduled` through the same `waitUntil` + `bookingEventPush` path as create/cancel/paid (soft-fail, token-clear on 404/403/410). See §4.4.
+
 ---
 
 ## 3. How agents / clients can talk to this backend
@@ -318,6 +354,7 @@ a secondary endpoint). Share URLs and single-use links are minted against
 | `/availability` | GET | multi-host slot search |
 | `/bookings` | POST | create (idempotent, atomic, optional `singleUseToken`) |
 | `/bookings/cancel` | POST | cancel + tick/room pruning in one tx |
+| `/bookings/:uid/reschedule` | POST | reschedule to new slot (idempotent, atomic tick swap, re-validates via availability engine + occupancy index; `booking.rescheduled` push) |
 | `/single-use-links[/:id]` | POST/GET/DELETE | one-time link create/list/revoke (owner-scoped) |
 | `/payments/create-intent` `/payments/mark-paid` | POST | Stripe PI; `paid` flips only after PI verification |
 | `/push-reminders` | POST | admin-only manual reminder-sweep trigger |
@@ -349,7 +386,7 @@ limiter (post-launch upgrade if needed).
   `metadata.fcmToken` (one token per user for v1; overwrite on refresh).
   Requires this contract deployed first — `UserMetadata` is strict.
 - **Lifecycle pushes** (to `bookings.host_user_id`, via `waitUntil`,
-  soft-fail): booking **created / cancelled / paid**.
+  soft-fail): booking **created / cancelled / paid / rescheduled**.
 - **Reminder sweep:** every 15 min (cron) + `POST /push-reminders` (admin).
   For each accepted booking, each configured offset in
   `metadata.prefs.reminderOffsets` (default `[10]`) whose fire time
@@ -359,7 +396,7 @@ limiter (post-launch upgrade if needed).
   ```jsonc
   {
     "notification": { "title": "New booking", "body": "Intro — Mon, Jun 1 at 1:00 PM" },
-    "data": { "bookingUid": "…", "action": "booking.created|booking.cancelled|booking.paid|booking.reminder", "offsetMin": "10" }
+    "data": { "bookingUid": "…", "action": "booking.created|booking.cancelled|booking.paid|booking.rescheduled|booking.reminder", "offsetMin": "10" }
   }
   ```
   (notification title/body present for lifecycle + reminder; `offsetMin` only
