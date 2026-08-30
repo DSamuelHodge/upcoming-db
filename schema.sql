@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL UNIQUE,
   username TEXT NOT NULL UNIQUE,
   timezone TEXT NOT NULL DEFAULT 'UTC',
-  metadata TEXT NOT NULL DEFAULT '{}'
+  metadata TEXT NOT NULL DEFAULT '{}',
+  display_name TEXT NOT NULL DEFAULT '',
+  avatar_url TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -37,7 +39,13 @@ CREATE TABLE IF NOT EXISTS event_types (
   buffer_after INTEGER NOT NULL DEFAULT 0,
   scheduling_type TEXT NOT NULL DEFAULT 'individual',
   locations TEXT NOT NULL DEFAULT '[]',
-  min_booking_notice INTEGER NOT NULL DEFAULT 0
+  min_booking_notice INTEGER NOT NULL DEFAULT 0,
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  price_in_cents INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'usd',
+  color_hex TEXT NOT NULL DEFAULT '#CC785C',
+  is_active INTEGER NOT NULL DEFAULT 1
 );
 CREATE UNIQUE INDEX IF NOT EXISTS event_type_owner_slug_unique ON event_types(owner_user_id, slug);
 
@@ -62,7 +70,10 @@ CREATE TABLE IF NOT EXISTS bookings (
   status TEXT NOT NULL DEFAULT 'accepted',
   cancelled_at TEXT,
   idempotency_key TEXT NOT NULL UNIQUE,
-  location TEXT
+  location TEXT,
+  paid INTEGER NOT NULL DEFAULT 0,
+  payment_intent_id TEXT,
+  created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS bookings_host_time_idx ON bookings(host_user_id, start_time, end_time);
 
@@ -88,7 +99,8 @@ CREATE TABLE IF NOT EXISTS attendees (
   email TEXT NOT NULL,
   name TEXT,
   timezone TEXT,
-  phone TEXT
+  phone TEXT,
+  notes TEXT
 );
 
 CREATE TABLE IF NOT EXISTS credentials (
