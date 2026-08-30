@@ -304,17 +304,21 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
   );
 
   // ---------------------------------------------------------------------------
-  // Reads (sanctioned read-only SQL path)
+  // Event types — reads are sanctioned read-only SQL; create/update/delete are
+  // owner-scoped mutations (JWT user must own the row; the shared secret alone
+  // acts as admin and may target anything).
   // ---------------------------------------------------------------------------
 
   app.get(
     "/event-types",
-    guarded(async () => {
-      const rows = await db
-        .select()
-        .from(schema.eventTypes)
-        .where(eq(schema.eventTypes.isActive, true))
-        .orderBy(asc(schema.eventTypes.id));
+    guarded(async (c) => {
+      // By default every event type is returned (deactivated ones included, so
+      // clients can list + re-activate them); ?activeOnly=true keeps the old
+      // behavior.
+      const activeOnly = c.req.query("activeOnly") === "true";
+      const rows = activeOnly
+        ? await db.select().from(schema.eventTypes).where(eq(schema.eventTypes.isActive, true)).orderBy(asc(schema.eventTypes.id))
+        : await db.select().from(schema.eventTypes).orderBy(asc(schema.eventTypes.id));
       const hosts = await db.select().from(schema.eventTypeHosts).orderBy(asc(schema.eventTypeHosts.priority));
       return Response.json(
         rows.map((et) => ({
@@ -322,6 +326,196 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
           hostUserIds: hosts.filter((h) => h.eventTypeId === et.id).map((h) => h.hostUserId),
         }))
       );
+    })
+  );
+
+  const LocationsMenu = z.array(z.object({ type: z.string().min(1) }).passthrough());
+
+  // `locations` may arrive as a real JSON array or as the JSON-encoded string
+  // clients cache (both end up as the string column value).
+  const locationsColumn = z.union([LocationsMenu, z.string()]).transform((v) =>
+    typeof v === "string" ? LocationsMenu.parse(JSON.parse(v)) : v
+  );
+
+  const CreateEventTypeInput = z
+    .object({
+      slug: z.string().min(1).max(80).regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, "slug must be lowercase kebab-case"),
+      title: z.string().min(1).max(200),
+      description: z.string().max(4000).optional(),
+      lengthMinutes: z.number().int().min(1).max(480),
+      slotIntervalMinutes: z.number().int().min(1).max(480).nullish(),
+      bufferBefore: z.number().int().min(0).max(480).optional(),
+      bufferAfter: z.number().int().min(0).max(480).optional(),
+      schedulingType: z.enum(["individual", "round_robin", "collective"]).optional(),
+      locations: locationsColumn.optional(),
+      minBookingNotice: z.number().int().min(0).max(10080).optional(),
+      priceInCents: z.number().int().min(0).optional(),
+      currency: z.string().regex(/^[a-z]{3}$/).optional(),
+      colorHex: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+      isActive: z.boolean().optional(),
+      // Admin-only override of the owner (ignored for JWT callers).
+      ownerUserId: z.number().int().positive().optional(),
+    })
+    .strict();
+
+  const UpdateEventTypeInput = CreateEventTypeInput.omit({ ownerUserId: true })
+    .partial()
+    .refine((v) => Object.keys(v).length > 0, { message: "at least one field to update is required" });
+
+  const eventTypePayload = async (row: typeof schema.eventTypes.$inferSelect) => {
+    const hostRows = await db
+      .select({ hostUserId: schema.eventTypeHosts.hostUserId })
+      .from(schema.eventTypeHosts)
+      .where(eq(schema.eventTypeHosts.eventTypeId, row.id))
+      .orderBy(asc(schema.eventTypeHosts.priority));
+    return { ...row, hostUserIds: hostRows.map((h) => h.hostUserId) };
+  };
+
+  const slugTaken = async (ownerUserId: number, slug: string, excludeId?: number) => {
+    const rows = await db
+      .select({ id: schema.eventTypes.id })
+      .from(schema.eventTypes)
+      .where(
+        excludeId === undefined
+          ? and(eq(schema.eventTypes.ownerUserId, ownerUserId), eq(schema.eventTypes.slug, slug))
+          : and(eq(schema.eventTypes.ownerUserId, ownerUserId), eq(schema.eventTypes.slug, slug), ne(schema.eventTypes.id, excludeId))
+      )
+      .limit(1);
+    return rows.length > 0;
+  };
+
+  app.post(
+    "/event-types",
+    guarded(async (c) => {
+      let input: z.infer<typeof CreateEventTypeInput>;
+      try {
+        input = CreateEventTypeInput.parse(await c.req.json());
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          return c.json({ error: `invalid input: ${err.issues.map((i) => i.path.join(".")).join(", ")}` }, 400);
+        }
+        if (err instanceof SyntaxError) return c.json({ error: "locations is not valid JSON" }, 400);
+        throw err;
+      }
+
+      const jwtUserId = c.get("authUserId") as number | undefined;
+      const isAdmin = c.get("authIsAdmin") === true;
+      let ownerUserId: number | undefined = jwtUserId;
+      if (ownerUserId === undefined && isAdmin && input.ownerUserId !== undefined) ownerUserId = input.ownerUserId;
+      if (ownerUserId === undefined) {
+        // Admin (shared secret) without an explicit owner: fall back to the
+        // lowest-id user, matching /me's single-tenant resolution.
+        const [first] = await db.select({ id: schema.users.id }).from(schema.users).orderBy(asc(schema.users.id)).limit(1);
+        if (!first) return c.json({ error: "no users exist; cannot infer event type owner" }, 400);
+        ownerUserId = first.id;
+      }
+
+      if (await slugTaken(ownerUserId, input.slug)) {
+        return c.json({ error: "slug already in use for this owner" }, 409);
+      }
+
+      const created = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .insert(schema.eventTypes)
+          .values({
+            ownerUserId,
+            slug: input.slug,
+            title: input.title,
+            description: input.description ?? "",
+            lengthMinutes: input.lengthMinutes,
+            slotIntervalMinutes: input.slotIntervalMinutes ?? null,
+            bufferBefore: input.bufferBefore ?? 0,
+            bufferAfter: input.bufferAfter ?? 0,
+            schedulingType: input.schedulingType ?? "individual",
+            locations: input.locations ? JSON.stringify(input.locations) : "[]",
+            minBookingNotice: input.minBookingNotice ?? 0,
+            priceInCents: input.priceInCents ?? 0,
+            currency: input.currency ?? "usd",
+            colorHex: input.colorHex ?? "#CC785C",
+            isActive: input.isActive ?? true,
+          })
+          .returning();
+        // Uniform host model: every event type (including individual) gets a
+        // host row; the owner hosts their own creation at priority 0.
+        await tx.insert(schema.eventTypeHosts).values({ eventTypeId: row.id, hostUserId: ownerUserId!, priority: 0 });
+        return row;
+      });
+
+      return Response.json(await eventTypePayload(created), { status: 201 });
+    })
+  );
+
+  app.patch(
+    "/event-types/:id",
+    guarded(async (c) => {
+      const id = Number(c.req.param("id"));
+      if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id must be a positive integer" }, 400);
+      const owned = await loadOwnedEventType(c, id);
+      if (owned.error) return owned.error;
+
+      let input: z.infer<typeof UpdateEventTypeInput>;
+      try {
+        input = UpdateEventTypeInput.parse(await c.req.json());
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          return c.json({ error: `invalid input: ${err.issues.map((i) => i.path.join(".")).join(", ")}` }, 400);
+        }
+        if (err instanceof SyntaxError) return c.json({ error: "locations is not valid JSON" }, 400);
+        throw err;
+      }
+
+      if (input.slug !== undefined && (await slugTaken(owned.data.row.ownerUserId, input.slug, id))) {
+        return c.json({ error: "slug already in use for this owner" }, 409);
+      }
+
+      const [updated] = await db
+        .update(schema.eventTypes)
+        .set({
+          ...(input.slug !== undefined ? { slug: input.slug } : {}),
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.lengthMinutes !== undefined ? { lengthMinutes: input.lengthMinutes } : {}),
+          ...(input.slotIntervalMinutes !== undefined ? { slotIntervalMinutes: input.slotIntervalMinutes ?? null } : {}),
+          ...(input.bufferBefore !== undefined ? { bufferBefore: input.bufferBefore } : {}),
+          ...(input.bufferAfter !== undefined ? { bufferAfter: input.bufferAfter } : {}),
+          ...(input.schedulingType !== undefined ? { schedulingType: input.schedulingType } : {}),
+          ...(input.locations !== undefined ? { locations: JSON.stringify(input.locations) } : {}),
+          ...(input.minBookingNotice !== undefined ? { minBookingNotice: input.minBookingNotice } : {}),
+          ...(input.priceInCents !== undefined ? { priceInCents: input.priceInCents } : {}),
+          ...(input.currency !== undefined ? { currency: input.currency } : {}),
+          ...(input.colorHex !== undefined ? { colorHex: input.colorHex } : {}),
+          ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
+        })
+        .where(eq(schema.eventTypes.id, id))
+        .returning();
+
+      return Response.json(await eventTypePayload(updated));
+    })
+  );
+
+  app.delete(
+    "/event-types/:id",
+    guarded(async (c) => {
+      const id = Number(c.req.param("id"));
+      if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id must be a positive integer" }, 400);
+      const owned = await loadOwnedEventType(c, id);
+      if (owned.error) return owned.error;
+
+      const [booking] = await db
+        .select({ id: schema.bookings.id })
+        .from(schema.bookings)
+        .where(eq(schema.bookings.eventTypeId, id))
+        .limit(1);
+      if (booking) {
+        return c.json({ error: "event type has bookings; deactivate it instead of deleting" }, 409);
+      }
+
+      await db.transaction(async (tx) => {
+        await tx.delete(schema.singleUseLinks).where(eq(schema.singleUseLinks.eventTypeId, id));
+        await tx.delete(schema.eventTypeHosts).where(eq(schema.eventTypeHosts.eventTypeId, id));
+        await tx.delete(schema.eventTypes).where(eq(schema.eventTypes.id, id));
+      });
+      return c.json({ ok: true });
     })
   );
 
@@ -780,7 +974,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
 
   /** Resolves the event type + owner username for link URL construction, and
    *  enforces ownership. Returns the error Response on failure. */
-  const loadOwnedEventTypeForLinks = async (
+  const loadOwnedEventType = async (
     c: AppContext,
     eventTypeId: number
   ): Promise<{ error: Response; data?: undefined } | { error?: undefined; data: { row: typeof schema.eventTypes.$inferSelect; ownerUsername: string } }> => {
@@ -815,7 +1009,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
         }
         throw err;
       }
-      const owned = await loadOwnedEventTypeForLinks(c, body.eventTypeId);
+      const owned = await loadOwnedEventType(c, body.eventTypeId);
       if (owned.error) return owned.error;
       const count = body.count ?? 1;
       const expiresUtc = body.expiresInDays
@@ -847,7 +1041,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       if (!Number.isInteger(eventTypeId) || eventTypeId <= 0) {
         return c.json({ error: "eventTypeId is required" }, 400);
       }
-      const owned = await loadOwnedEventTypeForLinks(c, eventTypeId);
+      const owned = await loadOwnedEventType(c, eventTypeId);
       if (owned.error) return owned.error;
       const rows = await db
         .select()
@@ -866,7 +1060,7 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id must be a positive integer" }, 400);
       const [link] = await db.select().from(schema.singleUseLinks).where(eq(schema.singleUseLinks.id, id)).limit(1);
       if (!link) return c.json({ error: "single-use link not found" }, 404);
-      const owned = await loadOwnedEventTypeForLinks(c, link.eventTypeId);
+      const owned = await loadOwnedEventType(c, link.eventTypeId);
       if (owned.error) return owned.error;
       if (!link.revokedUtc) {
         await db

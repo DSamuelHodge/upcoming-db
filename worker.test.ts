@@ -889,3 +889,174 @@ test("single-use links: burned on booking, reuse rejected, expired rejected", as
     close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Event-type mutations (create/update/delete) — phase-9
+// ---------------------------------------------------------------------------
+
+test("event-type mutations: create (with host row), slug conflict 409, update, delete", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWith(db);
+
+    // Unauthenticated create is 401.
+    assert.equal(
+      (await app.request("/event-types", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status,
+      401
+    );
+
+    // Create (admin secret → owner falls back to the lowest-id user).
+    const created = await app.request(
+      "/event-types",
+      authed("", {
+        method: "POST",
+        body: JSON.stringify({
+          slug: "workshop",
+          title: "Team Workshop",
+          lengthMinutes: 60,
+          schedulingType: "collective",
+          locations: [{ type: "integrations:daily" }],
+          priceInCents: 15000,
+        }),
+      })
+    );
+    assert.equal(created.status, 201);
+    const body = (await created.json()) as Record<string, unknown>;
+    assert.equal(body.slug, "workshop");
+    assert.equal(body.ownerUserId, 1);
+    assert.deepEqual(body.hostUserIds, [1]);
+    const createdId = body.id as number;
+
+    // Host row exists (uniform host model).
+    const hosts = await db.select().from(eventTypeHosts).where(eq(eventTypeHosts.eventTypeId, createdId));
+    assert.equal(hosts.length, 1);
+    assert.equal(hosts[0].hostUserId, 1);
+
+    // Duplicate slug for the same owner → 409.
+    const dup = await app.request(
+      "/event-types",
+      authed("", { method: "POST", body: JSON.stringify({ slug: "workshop", title: "Again", lengthMinutes: 30 }) })
+    );
+    assert.equal(dup.status, 409);
+
+    // Bad slug → 400.
+    assert.equal(
+      (await app.request(
+        "/event-types",
+        authed("", { method: "POST", body: JSON.stringify({ slug: "Bad Slug!", title: "X", lengthMinutes: 30 }) })
+      )).status,
+      400
+    );
+
+    // PATCH updates fields; slug change to a free slug works.
+    const patched = await app.request(
+      `/event-types/${createdId}`,
+      authed("", { method: "PATCH", body: JSON.stringify({ title: "Team Workshop v2", priceInCents: 20000 }) })
+    );
+    assert.equal(patched.status, 200);
+    const patchedBody = (await patched.json()) as Record<string, unknown>;
+    assert.equal(patchedBody.title, "Team Workshop v2");
+    assert.equal(patchedBody.priceInCents, 20000);
+
+    // PATCH slug conflict (seed row owns "intro") → 409.
+    const slugConflict = await app.request(
+      `/event-types/${createdId}`,
+      authed("", { method: "PATCH", body: JSON.stringify({ slug: "intro" }) })
+    );
+    assert.equal(slugConflict.status, 409);
+
+    // PATCH with empty body → 400; unknown id → 404.
+    assert.equal((await app.request(`/event-types/${createdId}`, authed("", { method: "PATCH", body: "{}" }))).status, 400);
+    assert.equal((await app.request("/event-types/999", authed("", { method: "PATCH", body: '{"title":"X"}' }))).status, 404);
+
+    // GET now includes deactivated rows by default; activeOnly hides them.
+    await app.request(`/event-types/${createdId}`, authed("", { method: "PATCH", body: JSON.stringify({ isActive: false }) }));
+    const all = (await (await app.request("/event-types", authed(""))).json()) as Array<Record<string, unknown>>;
+    assert.ok(all.some((r) => r.id === createdId && r.isActive === false));
+    const activeOnly = (await (await app.request("/event-types?activeOnly=true", authed(""))).json()) as Array<Record<string, unknown>>;
+    assert.ok(!activeOnly.some((r) => r.id === createdId));
+
+    // DELETE removes the type (+ links + hosts); unknown → 404.
+    await db.insert(singleUseLinks).values({
+      token: "delete-me-token-00001",
+      eventTypeId: createdId,
+      createdByUserId: 1,
+      createdUtc: "2026-01-01T00:00:00.000Z",
+    });
+    assert.equal((await app.request("/event-types/999", authed("", { method: "DELETE" }))).status, 404);
+    const deleted = await app.request(`/event-types/${createdId}`, authed("", { method: "DELETE" }));
+    assert.equal(deleted.status, 200);
+    assert.deepEqual(await db.select().from(eventTypeHosts).where(eq(eventTypeHosts.eventTypeId, createdId)), []);
+    assert.deepEqual(await db.select().from(singleUseLinks).where(eq(singleUseLinks.eventTypeId, createdId)), []);
+
+    // A type with bookings cannot be deleted → 409.
+    const bookingsBefore = await app.request("/bookings", authed(""));
+    void bookingsBefore;
+    const bookingRes = await app.request(
+      "/bookings",
+      authed("", {
+        method: "POST",
+        body: JSON.stringify({
+          eventTypeId: 1,
+          slotStartUtc: "2027-06-01T10:00:00Z",
+          slotEndUtc: "2027-06-01T10:30:00Z",
+          location: { type: "inPerson" },
+          attendee: { email: "guest@x.test" },
+          idempotencyKey: "del-guard-1",
+        }),
+      })
+    );
+    assert.equal(bookingRes.status, 200);
+    const guardedDelete = await app.request("/event-types/1", authed("", { method: "DELETE" }));
+    assert.equal(guardedDelete.status, 409);
+  } finally {
+    close();
+  }
+});
+
+test("event-type mutations are owner-scoped for JWT callers", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWithAuth(db);
+
+    // Sign up a second user; the seeded type belongs to user 1.
+    const signup = await app.request("/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "other@x.test", password: "hunter2hunter2", username: "other", timezone: "UTC" }),
+    });
+    assert.equal(signup.status, 201);
+    const { accessToken } = (await signup.json()) as { accessToken: string };
+    const jwtHeaders = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };
+
+    // PATCH someone else's type → 403.
+    assert.equal(
+      (await app.request("/event-types/1", { method: "PATCH", headers: jwtHeaders, body: JSON.stringify({ title: "Hijacked" }) })).status,
+      403
+    );
+    // DELETE someone else's type → 403.
+    assert.equal((await app.request("/event-types/1", { method: "DELETE", headers: jwtHeaders })).status, 403);
+
+    // Create as the JWT user → owner is the JWT subject, not user 1.
+    const created = await app.request("/event-types", {
+      method: "POST",
+      headers: jwtHeaders,
+      body: JSON.stringify({ slug: "mine", title: "Mine", lengthMinutes: 30 }),
+    });
+    assert.equal(created.status, 201);
+    const body = (await created.json()) as Record<string, unknown>;
+    assert.notEqual(body.ownerUserId, 1);
+    assert.deepEqual(body.hostUserIds, [body.ownerUserId]);
+
+    // The new owner can update and delete their own type.
+    assert.equal(
+      (await app.request(`/event-types/${body.id}`, { method: "PATCH", headers: jwtHeaders, body: JSON.stringify({ title: "Mine v2" }) })).status,
+      200
+    );
+    assert.equal((await app.request(`/event-types/${body.id}`, { method: "DELETE", headers: jwtHeaders })).status, 200);
+  } finally {
+    close();
+  }
+});
