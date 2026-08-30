@@ -18,6 +18,7 @@ type AppContext = Context<AppEnv>;
 import { and, asc, desc, eq, gt, inArray, isNotNull, lt, ne, or } from "drizzle-orm";
 import { createClient } from "@libsql/client";
 import { drizzle, type LibSQLDatabase } from "drizzle-orm/libsql";
+import { rateLimitMiddleware } from "./rate-limit";
 import { DateTime } from "luxon";
 import * as schema from "./schema";
 import {
@@ -121,6 +122,8 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
   //   falls through to the secret check (so a stale token with no secret
   //   configured still 401s).
   const OPEN_PATHS = new Set(["/health", "/auth/signup", "/auth/login", "/auth/refresh", "/auth/logout"]);
+  // Rate limit before auth: unauthenticated floods must not reach auth/DB work.
+  app.use("*", rateLimitMiddleware());
   app.use("*", async (c, next) => {
     if (OPEN_PATHS.has(c.req.path)) return next();
     const auth = c.req.header("Authorization") ?? "";
