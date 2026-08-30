@@ -1,0 +1,34 @@
+# getupcoming.app landing surface — a separate, stateless Worker.
+#
+# Deliberately isolated from the API worker (`wrangler.toml` / `src/worker.ts`):
+# landing changes deploy only here and never redeploy the JSON API that carries
+# auth, bookings, Stripe, FCM and the reminder cron.
+#
+# NO D1 binding, NO secrets, NO cron. Nothing here can leak DB or secret state.
+#
+# Deploy (after merge, under the ops runbook): `npm run deploy:landing`.
+# The custom domains below are attached on first deploy — Cloudflare creates the
+# proxied placeholder DNS + edge TLS; no manual DNS or cert work.
+
+name = "upcoming-landing"
+main = "src/landing/worker.ts"
+compatibility_date = "2026-08-01"
+workers_dev = false
+
+# Apex + www, attached as Workers custom domains. The www→apex 301 is handled in
+# the worker (host check); path routes (/, /privacy, /terms, /reset-password,
+# /.well-known/assetlinks.json, /{username}, /{username}/{slug}) live in
+# src/landing/worker.ts.
+[[routes]]
+pattern = "getupcoming.app"
+custom_domain = true
+
+[[routes]]
+pattern = "www.getupcoming.app"
+custom_domain = true
+
+[vars]
+# Empty = serve the branded hold page at `/`. Set to the live Play Store URL to
+# flip `/` to a 302 redirect at publication (no code change):
+#   npx wrangler vars put PLAY_STORE_URL https://play.google.com/store/apps/details?id=app.getupcoming
+PLAY_STORE_URL = ""
