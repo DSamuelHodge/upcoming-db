@@ -87,6 +87,12 @@ the live instance may additionally need a one-off additive `ALTER` because
   occupancy ticks + `booking_hosts` rows in the SAME transaction — an unpruned tick blocks
   the host's slot forever. Replays are idempotent by uid/idempotencyKey; `findOrphanedTicks`
   is the reconciliation safety net for bookings lost without pruning.
+- Booking READ routes (`GET /bookings`, `GET /bookings/:uid`) are own-scoped for JWT callers
+  (primary host, co-host, or attendee matching the caller's own user email; not-visible
+  detail is 404, not 403) while the shared-secret admin stays unscoped — same dual-auth
+  guard pattern as `loadOwnedEventType`/`loadTargetUser`. Contract: `Docs/api-contract.md`
+  §4.2 "Booking read scoping". Internal readers (reminder sweep, push fan-out) hit the db
+  directly and intentionally skip HTTP scoping.
 - Concurrency model: `host_occupancy_ticks` unique (host, minute-tick) is SQLite's stand-in
   for an exclusion constraint and is the actual serialization backstop — a losing tick insert
   surfaces as `SlotConflictError` in `createBookingHandler`, which also owns the SQLITE_BUSY
