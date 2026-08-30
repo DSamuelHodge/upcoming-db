@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { eq } from "drizzle-orm";
 import { createApp } from "./worker";
-import { attendees, availability, eventTypeHosts, eventTypes, schedules, singleUseLinks, users } from "./schema";
+import { attendees, availability, bookingHosts, bookings, eventTypeHosts, eventTypes, schedules, sessions, singleUseLinks, users } from "./schema";
 import { openTestDb, type TestDb } from "./test-db";
 
 const SECRET = "test-secret";
@@ -1110,6 +1110,117 @@ test("event-type mutations are owner-scoped for JWT callers", async () => {
       200
     );
     assert.equal((await app.request(`/event-types/${body.id}`, { method: "DELETE", headers: jwtHeaders })).status, 200);
+  } finally {
+    close();
+  }
+});
+
+test("booking reads are own-scoped for JWT callers (host, co-host, or attendee-by-own-email); admin secret stays all", async () => {
+  const { db, close } = await openTestDb();
+  try {
+    await seed(db);
+    const app = appWithAuth(db);
+
+    // Four JWT callers: the booking's primary host, its co-host, the invited
+    // attendee, and a cross-tenant stranger. The seeded type's primary host is
+    // user 1, so bookings are minted as user 1 and then re-hosted onto the
+    // signed-up primary host by direct row update (the write routes are not
+    // under test here).
+    const signupUser = async (email: string, username: string) => {
+      const res = await app.request("/auth/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: "hunter2hunter2", username, timezone: "UTC" }),
+      });
+      assert.equal(res.status, 201, `${username} signup should succeed`);
+      const body = (await res.json()) as { accessToken: string; user: { id: number } };
+      return { token: body.accessToken, id: body.user.id, headers: { Authorization: `Bearer ${body.accessToken}` } };
+    };
+    const owner = await signupUser("owner@x.test", "owner");
+    const cohost = await signupUser("cohost@x.test", "cohost");
+    const attendee = await signupUser("att@x.test", "att");
+    const stranger = await signupUser("other@x.test", "other");
+
+    // Booking A (13:00): primary host = owner, co-host = cohost. Booking B
+    // (15:00): host stays user 1, attendee = att (attendee-by-own-email path).
+    const mint = async (slotStartUtc: string, slotEndUtc: string, attendeeEmail: string, key: string) => {
+      const res = await app.request(
+        "/bookings",
+        authed("", {
+          method: "POST",
+          body: JSON.stringify({
+            eventTypeId: 1,
+            slotStartUtc,
+            slotEndUtc,
+            location: { type: "inPerson" },
+            attendee: { email: attendeeEmail },
+            idempotencyKey: key,
+          }),
+        })
+      );
+      assert.equal(res.status, 200);
+      const { uid } = (await res.json()) as { uid: string };
+      const [row] = await db.select().from(bookings).where(eq(bookings.uid, uid));
+      assert.ok(row);
+      return { uid, id: row.id };
+    };
+    const bookingA = await mint("2027-06-01T13:00:00Z", "2027-06-01T13:30:00Z", "guest@x.test", "scope-a");
+    const bookingB = await mint("2027-06-01T15:00:00Z", "2027-06-01T15:30:00Z", "att@x.test", "scope-b");
+    await db.update(bookings).set({ hostUserId: owner.id }).where(eq(bookings.id, bookingA.id));
+    await db.insert(bookingHosts).values({ bookingId: bookingA.id, hostUserId: cohost.id });
+
+    const listUids = async (headers: Record<string, string>, query = "") =>
+      ((await (await app.request(`/bookings${query}`, { headers })).json()) as Array<{ uid: string }>).map((r) => r.uid);
+
+    // Primary host sees own booking: detail 200 + present in list.
+    assert.equal((await app.request(`/bookings/${bookingA.uid}`, { headers: owner.headers })).status, 200);
+    assert.deepEqual(await listUids(owner.headers), [bookingA.uid]);
+
+    // Co-host sees the collective booking.
+    assert.equal((await app.request(`/bookings/${bookingA.uid}`, { headers: cohost.headers })).status, 200);
+    assert.deepEqual(await listUids(cohost.headers), [bookingA.uid]);
+
+    // Attendee (own users email matches attendees.email) sees a booking they
+    // are invited to — detail includes the attendee record.
+    const attDetail = await app.request(`/bookings/${bookingB.uid}`, { headers: attendee.headers });
+    assert.equal(attDetail.status, 200);
+    assert.equal(((await attDetail.json()) as { attendee: { email: string } | null }).attendee?.email, "att@x.test");
+    assert.deepEqual(await listUids(attendee.headers), [bookingB.uid]);
+
+    // Cross-tenant: another user's booking detail is 404 (existence is not
+    // leaked), and their bookings are absent from the list even when omitting
+    // all query params.
+    assert.equal((await app.request(`/bookings/${bookingA.uid}`, { headers: stranger.headers })).status, 404);
+    assert.equal((await app.request(`/bookings/${bookingB.uid}`, { headers: stranger.headers })).status, 404);
+    assert.equal((await app.request(`/bookings/${bookingB.uid}`, { headers: owner.headers })).status, 404);
+    assert.deepEqual(await listUids(stranger.headers), []);
+
+    // hostUserId query param: naming another user is forbidden; naming the
+    // caller just narrows their own set; narrowers keep working on top.
+    assert.equal((await app.request(`/bookings?hostUserId=${owner.id}`, { headers: stranger.headers })).status, 403);
+    assert.equal((await app.request("/bookings?hostUserId=1", { headers: owner.headers })).status, 403);
+    assert.deepEqual(await listUids(owner.headers, `?hostUserId=${owner.id}`), [bookingA.uid]);
+    assert.deepEqual(await listUids(attendee.headers, "?from=2027-06-01T16:00:00Z"), []);
+    assert.deepEqual(await listUids(attendee.headers, "?activeOnly=true"), [bookingB.uid]);
+
+    // Garbage hostUserId is rejected for JWT callers.
+    assert.equal((await app.request("/bookings?hostUserId=abc", { headers: owner.headers })).status, 400);
+
+    // A JWT whose user no longer exists is 404 (uniform with loadTargetUser).
+    await db.delete(sessions).where(eq(sessions.userId, attendee.id));
+    await db.delete(users).where(eq(users.id, attendee.id));
+    const ghostDetail = await app.request(`/bookings/${bookingB.uid}`, { headers: attendee.headers });
+    assert.equal(ghostDetail.status, 404);
+    assert.equal(((await ghostDetail.json()) as { error: string }).error, "user no longer exists");
+    assert.equal((await app.request("/bookings", { headers: attendee.headers })).status, 404);
+
+    // The legacy admin secret (no JWT) still sees everything unscoped — the
+    // ops surface is preserved.
+    const adminList = await listUids({ Authorization: `Bearer ${SECRET}` });
+    assert.deepEqual(adminList.sort(), [bookingA.uid, bookingB.uid].sort());
+    assert.equal((await app.request(`/bookings/${bookingA.uid}`, authed(""))).status, 200);
+    assert.equal((await app.request(`/bookings/${bookingB.uid}`, authed(""))).status, 200);
+    assert.equal((await app.request(`/bookings?hostUserId=${owner.id}`, authed(""))).status, 200);
   } finally {
     close();
   }

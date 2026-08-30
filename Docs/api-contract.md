@@ -350,7 +350,7 @@ a secondary endpoint). Share URLs and single-use links are minted against
 | `/event-types/:id` | DELETE | soft-delete (`isActive: false`, owner-scoped) |
 | `/me`, `/me/schedule` | GET/PATCH | profile + metadata (incl. `fcmToken`) + timezone lockstep |
 | `/me/credentials[/:type]` | GET/PUT/DELETE | BYO keys (AES-256-GCM at rest, masked hints out) |
-| `/bookings`, `/bookings/:uid` | GET | list/detail (JWT: own; admin: all) |
+| `/bookings`, `/bookings/:uid` | GET | list/detail (JWT: own — primary host, co-host, or attendee matching the caller's own user email; admin secret: all). Read scoping realized 2026-08-30 — see below |
 | `/availability` | GET | multi-host slot search |
 | `/bookings` | POST | create (idempotent, atomic, optional `singleUseToken`) |
 | `/bookings/cancel` | POST | cancel + tick/room pruning in one tx |
@@ -363,6 +363,29 @@ a secondary endpoint). Share URLs and single-use links are minted against
 `400 "body must be valid JSON"`; malformed `locations` field →
 `400 "locations is not valid JSON"`; validation issues include full Zod
 messages in the `detail` array. Duplicate `(owner, slug)` → 409.
+
+**Booking read scoping** (2026-08-30 — realizes the "JWT: own; admin: all"
+contract on `GET /bookings` and `GET /bookings/:uid`):
+
+- A **JWT caller** sees a booking only when they are the primary host
+  (`bookings.host_user_id`), a co-host (`booking_hosts.host_user_id`), or the
+  attendee whose email matches their own user row's email (`attendees` are
+  identified by email — there is no attendee userId column). A JWT caller is
+  scoped even if they also carry admin; the legacy shared **admin secret**
+  (no JWT) surface stays unscoped for ops, exactly like `/me` and event-type
+  mutation scoping.
+- Detail reads are **404** (not 403) when not visible — the existence of other
+  users' booking uids is not leaked. Message stays `"booking not found"`.
+- List reads AND a three-way own-predicate into the query; `from`/`to`/
+  `activeOnly` keep working as narrowers on top. A `hostUserId` query param
+  naming a user **other than the caller** is **403** `"forbidden: cannot
+  access another user"`; naming the caller it just narrows their own set;
+  non-integer/non-positive values are **400** for JWT callers.
+- A JWT whose user row no longer exists is **404** `"user no longer exists"`
+  (uniform with `/me` target-user resolution).
+- Internal server-side readers (the FCM reminder sweep, lifecycle push
+  fan-out) hit the database directly and never go through these HTTP routes —
+  scoping is an HTTP read-surface fix only.
 
 ### 4.3 Rate limiting (2026-08-30)
 
