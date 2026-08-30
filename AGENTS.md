@@ -66,6 +66,13 @@ the live instance may additionally need a one-off additive `ALTER` because
   interface, never on Drizzle/SQL. Keep it so; test with an in-memory fake repo. DST
   correctness comes from walking day-by-day in the schedule's local timezone — do not
   refactor into UTC arithmetic.
+- `src/fcm.ts` is soft-fail push (FCM HTTP v1, WebCrypto RS256 — no firebase-admin, it is
+  Node-only). Push never blocks or fails a booking flow; unregistered tokens are cleared
+  from `users.metadata.fcmToken`. The `*/15` cron + `POST /push-reminders` both no-op
+  without `FCM_SERVICE_ACCOUNT`. Payload contract: `Docs/api-contract.md` §4.4.
+- `src/rate-limit.ts` holds per-isolate per-endpoint tiers only — deliberately a best-effort
+  backstop, not a global guarantee. The authoritative control is the zone WAF rate-limit
+  rule (see `Docs/ops-runbook.md` §4). Don't "fix" this by adding shared state.
 - `src/multi-host-routing.ts` does no slot/DST math; it composes `computeAvailability` per host.
   Round-robin host choice at query time is a preview only — the real host is re-verified
   and assigned inside the booking transaction (`src/create-booking-handler.ts`).

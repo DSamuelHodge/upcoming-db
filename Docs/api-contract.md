@@ -281,3 +281,90 @@ The handler layer + `mapErrorToHttp` were designed for a thin HTTP wrapper:
 `GET /availability`, `POST /bookings`, `POST /bookings/cancel` (or
 `DELETE /bookings/:uid`), `GET /event-types`. Auth middleware issues/validates
 per-user secrets; handlers stay unchanged.
+
+---
+
+## 4. HTTP surface (as of 2026-08-30)
+
+The Upcoming Android client (separate repo) talks to this Worker over HTTPS.
+**Official base URL: `https://api.getupcoming.app`** (Workers custom domain on
+the `getupcoming.app` zone; the `*.workers.dev` deployment hostname remains as
+a secondary endpoint). Share URLs and single-use links are minted against
+`https://getupcoming.app`.
+
+### 4.1 Auth
+
+- **JWT (per-user):** `Authorization: Bearer <accessToken>` → `authUserId`;
+  owner-scoped. Minted by `/auth/signup` `/auth/login`, rotated by
+  `/auth/refresh` (HS256 access ~1h + opaque hashed refresh 30d).
+- **Shared secret (admin):** `Authorization: Bearer $API_SECRET` →
+  `authIsAdmin`; sees all owners' data. Server-side/operator use only — it
+  must never ship in a client binary.
+- **Open paths:** `/health`, `/auth/*`.
+
+### 4.2 Route table
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/health` | GET | liveness, exempt from rate limiting |
+| `/auth/signup` `/auth/login` `/auth/refresh` `/auth/logout` | POST | JWT pair lifecycle |
+| `/event-types` | GET | list (JWT: active + own inactive; `?activeOnly=true`; admin: all) |
+| `/event-types` | POST | create (owner = JWT user; host rows required) |
+| `/event-types/:id` | PATCH | update (owner-scoped) |
+| `/event-types/:id` | DELETE | soft-delete (`isActive: false`, owner-scoped) |
+| `/me`, `/me/schedule` | GET/PATCH | profile + metadata (incl. `fcmToken`) + timezone lockstep |
+| `/me/credentials[/:type]` | GET/PUT/DELETE | BYO keys (AES-256-GCM at rest, masked hints out) |
+| `/bookings`, `/bookings/:uid` | GET | list/detail (JWT: own; admin: all) |
+| `/availability` | GET | multi-host slot search |
+| `/bookings` | POST | create (idempotent, atomic, optional `singleUseToken`) |
+| `/bookings/cancel` | POST | cancel + tick/room pruning in one tx |
+| `/single-use-links[/:id]` | POST/GET/DELETE | one-time link create/list/revoke (owner-scoped) |
+| `/payments/create-intent` `/payments/mark-paid` | POST | Stripe PI; `paid` flips only after PI verification |
+| `/push-reminders` | POST | admin-only manual reminder-sweep trigger |
+
+**Event-type mutation errors** (POST/PATCH): malformed *body* JSON →
+`400 "body must be valid JSON"`; malformed `locations` field →
+`400 "locations is not valid JSON"`; validation issues include full Zod
+messages in the `detail` array. Duplicate `(owner, slug)` → 409.
+
+### 4.3 Rate limiting (2026-08-30)
+
+Two layers:
+
+1. **Cloudflare WAF rule (authoritative, global per IP per colo):** block
+   after **15 requests / 10s** on `api.getupcoming.app` (10s mitigation).
+   Returns Cloudflare's 429 block page.
+2. **Worker middleware (per-endpoint tiers, per-isolate best-effort):**
+   `POST /auth/*` 10/min · `GET /availability` 50/min · `POST /bookings*`
+   20/min · `POST /payments/*` 20/min · default 100/min. Returns
+   `429 {"error":"rate limit exceeded"}` with a `Retry-After` header (seconds).
+
+In-isolate counters under-approximate global limits by design (safe
+direction); true per-endpoint global enforcement would need a Durable Object
+limiter (post-launch upgrade if needed).
+
+### 4.4 Push (FCM, 2026-08-30)
+
+- **Registration:** client stores its FCM token via `PATCH /me` →
+  `metadata.fcmToken` (one token per user for v1; overwrite on refresh).
+  Requires this contract deployed first — `UserMetadata` is strict.
+- **Lifecycle pushes** (to `bookings.host_user_id`, via `waitUntil`,
+  soft-fail): booking **created / cancelled / paid**.
+- **Reminder sweep:** every 15 min (cron) + `POST /push-reminders` (admin).
+  For each accepted booking, each configured offset in
+  `metadata.prefs.reminderOffsets` (default `[10]`) whose fire time
+  (start − offset) lands in the sweep window fires once. Missing max-horizon
+  math: reminders up to 7 days ahead are covered.
+- **Payload:**
+  ```jsonc
+  {
+    "notification": { "title": "New booking", "body": "Intro — Mon, Jun 1 at 1:00 PM" },
+    "data": { "bookingUid": "…", "action": "booking.created|booking.cancelled|booking.paid|booking.reminder", "offsetMin": "10" }
+  }
+  ```
+  (notification title/body present for lifecycle + reminder; `offsetMin` only
+  on reminders.)
+- **Config:** `FCM_SERVICE_ACCOUNT` secret (service-account key JSON with
+  `project_id`, `client_email`, `private_key`). Unset = push disabled, cron
+  no-ops. Unregistered/invalid tokens (404/403/410) are cleared from metadata
+  automatically.
