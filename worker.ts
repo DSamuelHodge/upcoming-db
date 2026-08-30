@@ -314,11 +314,17 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     guarded(async (c) => {
       // By default every event type is returned (deactivated ones included, so
       // clients can list + re-activate them); ?activeOnly=true keeps the old
-      // behavior.
+      // behavior. Inactive rows are owner-scoped: a JWT caller sees their own
+      // deactivated types plus the cross-owner active catalog; the shared
+      // secret (admin — no JWT subject) sees everything.
       const activeOnly = c.req.query("activeOnly") === "true";
-      const rows = activeOnly
-        ? await db.select().from(schema.eventTypes).where(eq(schema.eventTypes.isActive, true)).orderBy(asc(schema.eventTypes.id))
-        : await db.select().from(schema.eventTypes).orderBy(asc(schema.eventTypes.id));
+      const jwtUserId = c.get("authUserId") as number | undefined;
+      const scope = activeOnly
+        ? eq(schema.eventTypes.isActive, true)
+        : jwtUserId === undefined
+          ? undefined
+          : or(eq(schema.eventTypes.isActive, true), eq(schema.eventTypes.ownerUserId, jwtUserId));
+      const rows = await db.select().from(schema.eventTypes).where(scope).orderBy(asc(schema.eventTypes.id));
       const hosts = await db.select().from(schema.eventTypeHosts).orderBy(asc(schema.eventTypeHosts.priority));
       return Response.json(
         rows.map((et) => ({
@@ -362,6 +368,11 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     .partial()
     .refine((v) => Object.keys(v).length > 0, { message: "at least one field to update is required" });
 
+  // Renders Zod issues as "path: message"; top-level issues (empty path, e.g.
+  // the empty-PATCH refine above) fall back to the bare message.
+  const zodDetail = (err: z.ZodError) =>
+    err.issues.map((i) => (i.path.length > 0 ? `${i.path.join(".")}: ${i.message}` : i.message)).join(", ");
+
   const eventTypePayload = async (row: typeof schema.eventTypes.$inferSelect) => {
     const hostRows = await db
       .select({ hostUserId: schema.eventTypeHosts.hostUserId })
@@ -387,12 +398,21 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
   app.post(
     "/event-types",
     guarded(async (c) => {
+      // Parse the body first so a malformed request body is not misreported as
+      // a malformed `locations` string (whose JSON.parse throws its own
+      // SyntaxError from inside the schema's transform).
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        return c.json({ error: "body must be valid JSON" }, 400);
+      }
       let input: z.infer<typeof CreateEventTypeInput>;
       try {
-        input = CreateEventTypeInput.parse(await c.req.json());
+        input = CreateEventTypeInput.parse(body);
       } catch (err) {
         if (err instanceof z.ZodError) {
-          return c.json({ error: `invalid input: ${err.issues.map((i) => i.path.join(".")).join(", ")}` }, 400);
+          return c.json({ error: `invalid input: ${zodDetail(err)}` }, 400);
         }
         if (err instanceof SyntaxError) return c.json({ error: "locations is not valid JSON" }, 400);
         throw err;
@@ -453,12 +473,20 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
       const owned = await loadOwnedEventType(c, id);
       if (owned.error) return owned.error;
 
+      // Same split as POST: body-parse failures are distinct from a malformed
+      // `locations` string inside an otherwise valid body.
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        return c.json({ error: "body must be valid JSON" }, 400);
+      }
       let input: z.infer<typeof UpdateEventTypeInput>;
       try {
-        input = UpdateEventTypeInput.parse(await c.req.json());
+        input = UpdateEventTypeInput.parse(body);
       } catch (err) {
         if (err instanceof z.ZodError) {
-          return c.json({ error: `invalid input: ${err.issues.map((i) => i.path.join(".")).join(", ")}` }, 400);
+          return c.json({ error: `invalid input: ${zodDetail(err)}` }, 400);
         }
         if (err instanceof SyntaxError) return c.json({ error: "locations is not valid JSON" }, 400);
         throw err;

@@ -949,6 +949,24 @@ test("event-type mutations: create (with host row), slug conflict 409, update, d
       400
     );
 
+    // Malformed request body → "body must be valid JSON" on both POST and PATCH,
+    // distinct from a malformed `locations` string inside a valid body.
+    const badBodyPost = await app.request("/event-types", authed("", { method: "POST", body: "{not json" }));
+    assert.equal(badBodyPost.status, 400);
+    assert.equal(((await badBodyPost.json()) as { error: string }).error, "body must be valid JSON");
+    const badBodyPatch = await app.request(`/event-types/${createdId}`, authed("", { method: "PATCH", body: "{not json" }));
+    assert.equal(badBodyPatch.status, 400);
+    assert.equal(((await badBodyPatch.json()) as { error: string }).error, "body must be valid JSON");
+    const badLocations = await app.request(
+      "/event-types",
+      authed("", {
+        method: "POST",
+        body: JSON.stringify({ slug: "bad-loc", title: "X", lengthMinutes: 30, locations: "[not json" }),
+      })
+    );
+    assert.equal(badLocations.status, 400);
+    assert.equal(((await badLocations.json()) as { error: string }).error, "locations is not valid JSON");
+
     // PATCH updates fields; slug change to a free slug works.
     const patched = await app.request(
       `/event-types/${createdId}`,
@@ -966,8 +984,13 @@ test("event-type mutations: create (with host row), slug conflict 409, update, d
     );
     assert.equal(slugConflict.status, 409);
 
-    // PATCH with empty body → 400; unknown id → 404.
-    assert.equal((await app.request(`/event-types/${createdId}`, authed("", { method: "PATCH", body: "{}" }))).status, 400);
+    // PATCH with empty body → 400 carrying the refine message; unknown id → 404.
+    const emptyPatch = await app.request(`/event-types/${createdId}`, authed("", { method: "PATCH", body: "{}" }));
+    assert.equal(emptyPatch.status, 400);
+    assert.equal(
+      ((await emptyPatch.json()) as { error: string }).error,
+      "invalid input: at least one field to update is required"
+    );
     assert.equal((await app.request("/event-types/999", authed("", { method: "PATCH", body: '{"title":"X"}' }))).status, 404);
 
     // GET now includes deactivated rows by default; activeOnly hides them.
@@ -1049,6 +1072,37 @@ test("event-type mutations are owner-scoped for JWT callers", async () => {
     const body = (await created.json()) as Record<string, unknown>;
     assert.notEqual(body.ownerUserId, 1);
     assert.deepEqual(body.hostUserIds, [body.ownerUserId]);
+
+    // Listing: active rows are a cross-owner catalog, but deactivated rows are
+    // visible only to their owner (JWT) or the shared-secret admin.
+    const list1 = (await (await app.request("/event-types", { headers: jwtHeaders })).json()) as Array<
+      Record<string, unknown>
+    >;
+    assert.ok(list1.some((r) => r.id === 1));
+    assert.ok(list1.some((r) => r.id === body.id));
+    await db.update(eventTypes).set({ isActive: false }).where(eq(eventTypes.id, 1));
+    const list2 = (await (await app.request("/event-types", { headers: jwtHeaders })).json()) as Array<
+      Record<string, unknown>
+    >;
+    assert.ok(!list2.some((r) => r.id === 1));
+    assert.ok(list2.some((r) => r.id === body.id));
+    await app.request(`/event-types/${body.id}`, {
+      method: "PATCH",
+      headers: jwtHeaders,
+      body: JSON.stringify({ isActive: false }),
+    });
+    const list3 = (await (await app.request("/event-types", { headers: jwtHeaders })).json()) as Array<
+      Record<string, unknown>
+    >;
+    assert.ok(list3.some((r) => r.id === body.id && r.isActive === false));
+    assert.ok(!list3.some((r) => r.id === 1));
+    const list3ActiveOnly = (await (await app.request("/event-types?activeOnly=true", { headers: jwtHeaders })).json()) as Array<
+      Record<string, unknown>
+    >;
+    assert.ok(!list3ActiveOnly.some((r) => r.id === body.id));
+    const adminList = (await (await app.request("/event-types", authed(""))).json()) as Array<Record<string, unknown>>;
+    assert.ok(adminList.some((r) => r.id === 1 && r.isActive === false));
+    assert.ok(adminList.some((r) => r.id === body.id && r.isActive === false));
 
     // The new owner can update and delete their own type.
     assert.equal(
