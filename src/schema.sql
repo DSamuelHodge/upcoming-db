@@ -135,3 +135,14 @@ CREATE TABLE IF NOT EXISTS single_use_links (
   revoked_utc TEXT
 );
 CREATE INDEX IF NOT EXISTS single_use_links_event_type_idx ON single_use_links(event_type_id);
+
+-- Reschedule idempotency (additive, 2026-08-30).
+CREATE TABLE IF NOT EXISTS reschedule_idempotency (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  booking_id INTEGER NOT NULL REFERENCES bookings(id),
+  new_start_time TEXT NOT NULL,
+  new_end_time TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reschedule_idempotency_booking_idx ON reschedule_idempotency(booking_id);

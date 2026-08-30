@@ -204,12 +204,13 @@ export async function sendPushToUser(
 // Booking lifecycle pushes — fired from the route handlers via waitUntil.
 // ---------------------------------------------------------------------------
 
-export type BookingPushAction = "booking.created" | "booking.cancelled" | "booking.paid";
+export type BookingPushAction = "booking.created" | "booking.cancelled" | "booking.paid" | "booking.rescheduled";
 
 const PUSH_TITLES: Record<BookingPushAction, string> = {
   "booking.created": "New booking",
   "booking.cancelled": "Booking cancelled",
   "booking.paid": "Payment received",
+  "booking.rescheduled": "Booking rescheduled",
 };
 
 async function formatForHost(db: AppDb, hostUserId: number, startTimeUtc: string): Promise<string> {

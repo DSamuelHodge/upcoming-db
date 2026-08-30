@@ -28,6 +28,7 @@ import {
   createBookingHandler,
   makeTxRepository,
   mapErrorToHttp,
+  rescheduleBookingHandler,
 } from "./create-booking-handler";
 import { EventTypeNotFoundError, loadEventType } from "./event-types";
 import { computeMultiHostAvailability } from "./multi-host-routing";
@@ -992,6 +993,43 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
     guarded(async (c) => {
       const result = await cancelBookingHandler(db, await c.req.json());
       waitUntil(c, bookingEventPush(db, env, result.uid, "booking.cancelled").catch(() => {}));
+      return Response.json(result);
+    })
+  );
+
+  app.post(
+    "/bookings/:uid/reschedule",
+    guarded(async (c) => {
+      const uid = c.req.param("uid") ?? "";
+      if (!uid) return c.json({ error: "uid is required" }, 400);
+      // Owner-scoping: admin bypasses, JWT must be host or event-type owner.
+      // This keeps invitee-proposed negotiation future-work but prevents
+      // one host from moving another host's bookings in multi-tenant deploys.
+      const jwtUserId = c.get("authUserId") as number | undefined;
+      const isAdmin = c.get("authIsAdmin") === true;
+      if (jwtUserId !== undefined && !isAdmin) {
+        const [booking] = await db.select().from(schema.bookings).where(eq(schema.bookings.uid, uid)).limit(1);
+        if (!booking) return c.json({ error: "booking not found" }, 404);
+        const [et] = await db.select({ ownerUserId: schema.eventTypes.ownerUserId }).from(schema.eventTypes).where(eq(schema.eventTypes.id, booking.eventTypeId)).limit(1);
+        const isHost = booking.hostUserId === jwtUserId;
+        const isOwner = et?.ownerUserId === jwtUserId;
+        // Also allow any secondary host on a collective booking
+        let isSecondary = false;
+        if (!isHost && !isOwner) {
+          const [sec] = await db
+            .select({ id: schema.bookingHosts.id })
+            .from(schema.bookingHosts)
+            .where(and(eq(schema.bookingHosts.bookingId, booking.id), eq(schema.bookingHosts.hostUserId, jwtUserId)))
+            .limit(1);
+          isSecondary = !!sec;
+        }
+        if (!isHost && !isOwner && !isSecondary) {
+          return c.json({ error: "forbidden: not the booking host or event type owner" }, 403);
+        }
+      }
+      const body = await c.req.json();
+      const result = await rescheduleBookingHandler(db, uid, body);
+      waitUntil(c, bookingEventPush(db, env, result.uid, "booking.rescheduled").catch(() => {}));
       return Response.json(result);
     })
   );
