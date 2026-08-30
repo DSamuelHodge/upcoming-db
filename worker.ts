@@ -748,6 +748,141 @@ export function createApp(env: WorkerEnv, deps: AppDeps = {}) {
   );
 
   // ---------------------------------------------------------------------------
+  // Single-use booking links (2026-08-30) — Calendly-style one-time links.
+  // Owner-scoped: a JWT user may only manage links for event types they own
+  // (the shared API_SECRET acts as admin). URLs use the official domain.
+  // ---------------------------------------------------------------------------
+
+  const SINGLE_USE_BASE_URL = "https://getupcoming.app";
+
+  const singleUseStatus = (row: typeof schema.singleUseLinks.$inferSelect): string => {
+    if (row.revokedUtc) return "revoked";
+    if (row.usedUtc) return "used";
+    if (row.expiresUtc && new Date(row.expiresUtc).getTime() <= Date.now()) return "expired";
+    return "unused";
+  };
+
+  const singleUseLinkPayload = (
+    row: typeof schema.singleUseLinks.$inferSelect,
+    ownerUsername: string,
+    eventSlug: string
+  ) => ({
+    id: row.id,
+    token: row.token,
+    url: `${SINGLE_USE_BASE_URL}/${ownerUsername}/${eventSlug}?lid=${row.token}`,
+    eventTypeId: row.eventTypeId,
+    createdAt: row.createdUtc,
+    expiresAt: row.expiresUtc,
+    usedAt: row.usedUtc,
+    revokedAt: row.revokedUtc,
+    status: singleUseStatus(row),
+  });
+
+  /** Resolves the event type + owner username for link URL construction, and
+   *  enforces ownership. Returns the error Response on failure. */
+  const loadOwnedEventTypeForLinks = async (
+    c: AppContext,
+    eventTypeId: number
+  ): Promise<{ error: Response; data?: undefined } | { error?: undefined; data: { row: typeof schema.eventTypes.$inferSelect; ownerUsername: string } }> => {
+    const [row] = await db.select().from(schema.eventTypes).where(eq(schema.eventTypes.id, eventTypeId)).limit(1);
+    if (!row) return { error: await Response.json({ error: "event type not found" }, { status: 404 }) };
+    const jwtUserId = c.get("authUserId") as number | undefined;
+    if (c.get("authIsAdmin") !== true || jwtUserId !== undefined) {
+      if (jwtUserId === undefined || row.ownerUserId !== jwtUserId) {
+        return { error: await Response.json({ error: "forbidden: not the event type owner" }, { status: 403 }) };
+      }
+    }
+    const [owner] = await db.select({ username: schema.users.username }).from(schema.users).where(eq(schema.users.id, row.ownerUserId)).limit(1);
+    return { data: { row, ownerUsername: owner?.username ?? "" } };
+  };
+
+  app.post(
+    "/single-use-links",
+    guarded(async (c) => {
+      let body: { eventTypeId: number; count?: number; expiresInDays?: number };
+      try {
+        body = z
+          .object({
+            eventTypeId: z.number().int().positive(),
+            count: z.number().int().min(1).max(50).optional(),
+            expiresInDays: z.number().int().min(1).max(365).optional(),
+          })
+          .strict()
+          .parse(await c.req.json());
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          return c.json({ error: "body must be { eventTypeId, count?, expiresInDays? }" }, 400);
+        }
+        throw err;
+      }
+      const owned = await loadOwnedEventTypeForLinks(c, body.eventTypeId);
+      if (owned.error) return owned.error;
+      const count = body.count ?? 1;
+      const expiresUtc = body.expiresInDays
+        ? new Date(Date.now() + body.expiresInDays * 24 * 3600 * 1000).toISOString()
+        : null;
+      const rows = await db
+        .insert(schema.singleUseLinks)
+        .values(
+          Array.from({ length: count }, () => ({
+            token: generateRefreshToken(),
+            eventTypeId: body.eventTypeId,
+            createdByUserId: owned.data.row.ownerUserId,
+            createdUtc: new Date().toISOString(),
+            expiresUtc,
+          }))
+        )
+        .returning();
+      return Response.json(
+        rows.map((row) => singleUseLinkPayload(row, owned.data.ownerUsername, owned.data.row.slug)),
+        { status: 201 }
+      );
+    })
+  );
+
+  app.get(
+    "/single-use-links",
+    guarded(async (c) => {
+      const eventTypeId = Number(c.req.query("eventTypeId"));
+      if (!Number.isInteger(eventTypeId) || eventTypeId <= 0) {
+        return c.json({ error: "eventTypeId is required" }, 400);
+      }
+      const owned = await loadOwnedEventTypeForLinks(c, eventTypeId);
+      if (owned.error) return owned.error;
+      const rows = await db
+        .select()
+        .from(schema.singleUseLinks)
+        .where(eq(schema.singleUseLinks.eventTypeId, eventTypeId))
+        .orderBy(desc(schema.singleUseLinks.id))
+        .limit(200);
+      return Response.json(rows.map((row) => singleUseLinkPayload(row, owned.data.ownerUsername, owned.data.row.slug)));
+    })
+  );
+
+  app.delete(
+    "/single-use-links/:id",
+    guarded(async (c) => {
+      const id = Number(c.req.param("id"));
+      if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id must be a positive integer" }, 400);
+      const [link] = await db.select().from(schema.singleUseLinks).where(eq(schema.singleUseLinks.id, id)).limit(1);
+      if (!link) return c.json({ error: "single-use link not found" }, 404);
+      const owned = await loadOwnedEventTypeForLinks(c, link.eventTypeId);
+      if (owned.error) return owned.error;
+      if (!link.revokedUtc) {
+        await db
+          .update(schema.singleUseLinks)
+          .set({ revokedUtc: new Date().toISOString() })
+          .where(eq(schema.singleUseLinks.id, id));
+      }
+      return Response.json({
+        id,
+        status: "revoked",
+        url: singleUseLinkPayload(link, owned.data.ownerUsername, owned.data.row.slug).url,
+      });
+    })
+  );
+
+  // ---------------------------------------------------------------------------
   // Stripe paid-booking flow (test mode). The secret key stays here; clients
   // only ever see the PaymentIntent client_secret.
   // ---------------------------------------------------------------------------

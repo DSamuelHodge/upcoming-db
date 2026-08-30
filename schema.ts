@@ -225,3 +225,29 @@ export const credentials = sqliteTable("credentials", {
   type: text("type").notNull(), // 'google_calendar' | 'office365_calendar' | ...
   encryptedToken: text("encrypted_token").notNull(),
 });
+
+// Single-use booking links (additive, 2026-08-30): each row is one Calendly-
+// style one-time booking link for an event type. Burned exactly once by
+// createBookingHandler when a booking lands carrying its token.
+export const singleUseLinks = sqliteTable(
+  "single_use_links",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    // Public, unguessable token embedded in the share URL (?lid=...).
+    token: text("token").notNull().unique(),
+    eventTypeId: integer("event_type_id")
+      .notNull()
+      .references(() => eventTypes.id),
+    createdByUserId: integer("created_by_user_id")
+      .notNull()
+      .references(() => users.id),
+    createdUtc: text("created_utc").notNull(),
+    expiresUtc: text("expires_utc"), // optional deadline; null = never expires
+    usedBookingId: integer("used_booking_id").references(() => bookings.id),
+    usedUtc: text("used_utc"),
+    revokedUtc: text("revoked_utc"),
+  },
+  (t) => ({
+    eventTypeIdx: index("single_use_links_event_type_idx").on(t.eventTypeId),
+  })
+);
