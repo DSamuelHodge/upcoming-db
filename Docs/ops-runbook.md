@@ -9,9 +9,10 @@ redaction policy — live endpoints live in `.env` / `pass`, never here.
 | piece | value |
 |---|---|
 | Worker | `upcoming-db-api` (Hono, `src/worker.ts`) — official URL `https://api.getupcoming.app` (Workers custom domain on the `getupcoming.app` zone); `*.workers.dev` hostname secondary |
+| Landing Worker | `upcoming-landing` (`src/landing/worker.ts`) — static surface on `getupcoming.app` + `www.getupcoming.app` (Workers custom domains); no DB, no secrets, no cron. Deploy: `npm run deploy:landing` (`npx wrangler deploy -c wrangler-landing.toml`) |
 | DB | Turso instance `upcoming-db-v2` (group `default`, `aws-us-west-2`) |
 | Cron | `*/15 * * * *` — reminder-push sweep (`scheduled()` in `src/worker.ts`; no-ops without `FCM_SERVICE_ACCOUNT`) |
-| Deploy | manual: `npx wrangler deploy` from repo root on `main` |
+| Deploy | manual: `npx wrangler deploy` from repo root on `main` (API worker) — landing changes never redeploy the API |
 
 ## 2. Backups & restore drill
 
@@ -52,6 +53,13 @@ the next isolate spin-up; no redeploy required.
 |---|---|---|
 | WAF flood ceiling (authoritative, global per IP per colo) | zone `getupcoming.app` → Security → WAF → Rate limiting rules (`http_ratelimit` phase; rule id `1866625031b44d439fac90ea6b1e6318`) | 15 req/10s block 10s. Free plan = 1 rule; raise the plan for per-path edge rules |
 | Worker tiers (per-endpoint, per-isolate) | `src/rate-limit.ts` (`RATE_LIMIT_TIERS`) | `/auth/*` 10/min · `/availability` 50/min · `POST /bookings*` + `/payments/*` 20/min · default 100/min; 429 + `Retry-After` |
+
+The WAF ceiling above is scoped to `api.getupcoming.app` only — apex/`www`
+landing traffic (the `upcoming-landing` worker) has **no per-IP flood ceiling**
+(the free-plan 1-rule cap is already consumed). Accepted: the landing worker is
+stateless, secretless, authless static content, and Cloudflare's managed L7 DDoS
+protection still applies zone-wide. Triage "rate limit exceeded" on the landing
+host against that (absent) layer, not the API ceiling.
 
 In-isolate counters deliberately under-approximate global limits. If
 per-endpoint global enforcement is ever required, add a Durable Object
